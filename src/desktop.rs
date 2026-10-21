@@ -47,7 +47,7 @@ pub fn show(
         let rgba = renderer.capture_scene(&scene, &states)?;
         for (pixel, rgba) in buffer[WIDTH * TOOLBAR..]
             .iter_mut()
-            .zip(rgba.chunks_exact(4))
+            .zip(rgba.as_chunks::<4>().0.iter())
         {
             *pixel = (rgba[0] as u32) << 16 | (rgba[1] as u32) << 8 | rgba[2] as u32;
         }

@@ -234,7 +234,7 @@ impl Renderer {
                     height: height as f64,
                     center: [costume.rotation_center_x, costume.rotation_center_y],
                     resolution: costume.bitmap_resolution,
-                    alpha: rgba.chunks_exact(4).map(|p| p[3]).collect(),
+                    alpha: rgba.as_chunks::<4>().0.iter().map(|p| p[3]).collect(),
                 });
             }
             costumes.push(list);
@@ -519,7 +519,7 @@ fn decode(name: &str, data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
         let image = reader.decode().context("decode bitmap costume")?.to_rgba8();
         let (w, h) = image.dimensions();
         let mut rgba = image.into_raw();
-        for p in rgba.chunks_exact_mut(4) {
+        for p in rgba.as_chunks_mut::<4>().0 {
             for c in 0..3 {
                 p[c] = ((p[c] as u16 * p[3] as u16 + 127) / 255) as u8;
             }
@@ -613,13 +613,18 @@ mod tests {
         assert!(!text.is_empty(), "CPU did not produce terminal output");
         let layer = scene.pen.lock().unwrap();
         assert!(
-            layer.pixels.chunks_exact(4).any(|p| p[3] > 0),
+            layer.pixels.as_chunks::<4>().0.iter().any(|p| p[3] > 0),
             "terminal did not draw any pen pixels"
         );
         drop(layer);
         let mut renderer = pollster::block_on(Renderer::new(&project))?;
         let rgba = renderer.capture_scene(&scene, &report.sprites)?;
-        assert!(rgba.chunks_exact(4).any(|p| p[..3] != [255, 255, 255]));
+        assert!(
+            rgba.as_chunks::<4>()
+                .0
+                .iter()
+                .any(|p| p[..3] != [255, 255, 255])
+        );
         if let Ok(path) = std::env::var("MSBJIT_HARDWARE_CAPTURE") {
             image::save_buffer(path, &rgba, WIDTH, HEIGHT, image::ColorType::Rgba8)?;
         }
