@@ -83,7 +83,8 @@ def main():
                      for v, runs in samples.items()}
             speedup = rates["after"] / rates["before"] if rates["before"] else None
             results["workloads"][name] = {"samples": samples, "rates": rates, "speedup": speedup}
-            print(f"{name}: {rates['before']:.1f} -> {rates['after']:.1f} /s ({speedup:.2f}x)", flush=True)
+            speedup_text = f"{speedup:.2f}x" if speedup is not None else "baseline counter is zero"
+            print(f"{name}: {rates['before']:.1f} -> {rates['after']:.1f} /s ({speedup_text})", flush=True)
             args.output.write_text(json.dumps(results, indent=2), encoding="utf-8")
 
 

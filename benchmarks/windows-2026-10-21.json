@@ -1,0 +1,286 @@
+{
+  "platform": "Windows-11-10.0.26200-SP0",
+  "seconds": 2.0,
+  "repeats": 3,
+  "executables": {
+    "before": "D:\\GitHub\\Repositories\\MSBJIT\\local\\msbjit-before-release.exe",
+    "after": "D:\\GitHub\\Repositories\\MSBJIT\\local\\msbjit.exe"
+  },
+  "workloads": {
+    "arithmetic": {
+      "samples": {
+        "before": [
+          {
+            "count": 9669464.0,
+            "steps": 19338928,
+            "elapsed": 2.0000009,
+            "wall": 3.1545149000012316,
+            "count_per_second": 4834729.824371579
+          },
+          {
+            "count": 10275043.0,
+            "steps": 20550086,
+            "elapsed": 2.0000015,
+            "wall": 2.0860457999951905,
+            "count_per_second": 5137517.646861765
+          },
+          {
+            "count": 9954917.0,
+            "steps": 19909834,
+            "elapsed": 2.0000032,
+            "wall": 2.077297700001509,
+            "count_per_second": 4977450.536079142
+          }
+        ],
+        "after": [
+          {
+            "count": 270168992.0,
+            "steps": 540337984,
+            "elapsed": 2.0000113,
+            "wall": 3.794893599988427,
+            "count_per_second": 135083732.7769098
+          },
+          {
+            "count": 279343680.0,
+            "steps": 558687360,
+            "elapsed": 2.0000081,
+            "wall": 2.0838783999934094,
+            "count_per_second": 139671274.33133894
+          },
+          {
+            "count": 271818240.0,
+            "steps": 543636480,
+            "elapsed": 2.0000074,
+            "wall": 2.078126299995347,
+            "count_per_second": 135908617.1381166
+          }
+        ]
+      },
+      "rates": {
+        "before": 4977450.536079142,
+        "after": 135908617.1381166
+      },
+      "speedup": 27.304865443258645
+    },
+    "numeric-list": {
+      "samples": {
+        "before": [
+          {
+            "count": 5833168.0,
+            "steps": 17499505,
+            "elapsed": 2.0000515,
+            "wall": 2.1563323000009404,
+            "count_per_second": 2916508.8998958278
+          },
+          {
+            "count": 6767983.0,
+            "steps": 20303949,
+            "elapsed": 2.000052,
+            "wall": 2.0819283000018913,
+            "count_per_second": 3383903.5185085186
+          },
+          {
+            "count": 6560867.0,
+            "steps": 19682602,
+            "elapsed": 2.0000523,
+            "wall": 2.083519799998612,
+            "count_per_second": 3280347.7189071504
+          }
+        ],
+        "after": [
+          {
+            "count": 115182720.0,
+            "steps": 345548160,
+            "elapsed": 2.0000071,
+            "wall": 2.0826747000101022,
+            "count_per_second": 57591155.55139779
+          },
+          {
+            "count": 121244821.0,
+            "steps": 363734464,
+            "elapsed": 2.0000084,
+            "wall": 2.081336699993699,
+            "count_per_second": 60622155.88694528
+          },
+          {
+            "count": 120334912.0,
+            "steps": 361004736,
+            "elapsed": 2.0000057,
+            "wall": 2.0917040999920573,
+            "count_per_second": 60167284.523239106
+          }
+        ]
+      },
+      "rates": {
+        "before": 3280347.7189071504,
+        "after": 60167284.523239106
+      },
+      "speedup": 18.341739863871464
+    },
+    "broadcast-empty": {
+      "samples": {
+        "before": [
+          {
+            "count": 1299.0,
+            "steps": 5196,
+            "elapsed": 2.000327,
+            "wall": 2.0874830999964615,
+            "count_per_second": 649.393824109758
+          },
+          {
+            "count": 1343.0,
+            "steps": 5372,
+            "elapsed": 2.0004829,
+            "wall": 2.0899344999925233,
+            "count_per_second": 671.337905462726
+          },
+          {
+            "count": 1333.0,
+            "steps": 5332,
+            "elapsed": 2.0012084,
+            "wall": 2.089237399995909,
+            "count_per_second": 666.0975438639974
+          }
+        ],
+        "after": [
+          {
+            "count": 2164014.0,
+            "steps": 8656058,
+            "elapsed": 2.0000007,
+            "wall": 2.077364700002363,
+            "count_per_second": 1082006.6212976824
+          },
+          {
+            "count": 2250656.0,
+            "steps": 9002624,
+            "elapsed": 2.0000007,
+            "wall": 2.0759698000038043,
+            "count_per_second": 1125327.6061353378
+          },
+          {
+            "count": 2421575.0,
+            "steps": 9686302,
+            "elapsed": 2.0000006,
+            "wall": 2.0710645000071963,
+            "count_per_second": 1210787.136763859
+          }
+        ]
+      },
+      "rates": {
+        "before": 666.0975438639974,
+        "after": 1125327.6061353378
+      },
+      "speedup": 1689.4336520254535
+    },
+    "broadcast-ram": {
+      "samples": {
+        "before": [
+          {
+            "count": 1220.0,
+            "steps": 4880,
+            "elapsed": 2.0008631,
+            "wall": 2.1081505000038305,
+            "count_per_second": 609.736868054591
+          },
+          {
+            "count": 1141.0,
+            "steps": 4564,
+            "elapsed": 2.0014377,
+            "wall": 2.08289479999803,
+            "count_per_second": 570.0901906664394
+          },
+          {
+            "count": 1237.0,
+            "steps": 4948,
+            "elapsed": 2.0000826,
+            "wall": 2.0980493999959435,
+            "count_per_second": 618.4744570049257
+          }
+        ],
+        "after": [
+          {
+            "count": 2283091.0,
+            "steps": 9132366,
+            "elapsed": 2.0000007,
+            "wall": 2.095096100005321,
+            "count_per_second": 1141545.1004592148
+          },
+          {
+            "count": 2405689.0,
+            "steps": 9622758,
+            "elapsed": 2.0000008,
+            "wall": 2.082342499998049,
+            "count_per_second": 1202844.0188623925
+          },
+          {
+            "count": 2414031.0,
+            "steps": 9656126,
+            "elapsed": 2.0000005,
+            "wall": 2.089478699999745,
+            "count_per_second": 1207015.1982462003
+          }
+        ]
+      },
+      "rates": {
+        "before": 609.736868054591,
+        "after": 1202844.0188623925
+      },
+      "speedup": 1972.7264036044796
+    },
+    "hardware-emulator": {
+      "samples": {
+        "before": [
+          {
+            "count": 3412.0,
+            "steps": 1229280,
+            "elapsed": 2.0000616,
+            "wall": 2.3685283999948297,
+            "count_per_second": 1705.94745681833
+          },
+          {
+            "count": 3557.0,
+            "steps": 1252186,
+            "elapsed": 2.0000878,
+            "wall": 2.3982628999947337,
+            "count_per_second": 1778.4219272773923
+          },
+          {
+            "count": 3515.0,
+            "steps": 1245536,
+            "elapsed": 2.0001278,
+            "wall": 2.4746071999979904,
+            "count_per_second": 1757.387702925783
+          }
+        ],
+        "after": [
+          {
+            "count": 250672.0,
+            "steps": 40378788,
+            "elapsed": 2.000001,
+            "wall": 2.6527044999966165,
+            "count_per_second": 125335.93733203133
+          },
+          {
+            "count": 267228.0,
+            "steps": 43000016,
+            "elapsed": 2.0000007,
+            "wall": 2.6056217000004835,
+            "count_per_second": 133613.95323511635
+          },
+          {
+            "count": 210647.0,
+            "steps": 34041443,
+            "elapsed": 2.0000009,
+            "wall": 2.583302500002901,
+            "count_per_second": 105323.45260444634
+          }
+        ]
+      },
+      "rates": {
+        "before": 1757.387702925783,
+        "after": 125335.93733203133
+      },
+      "speedup": 71.31945735330119
+    }
+  }
+}
