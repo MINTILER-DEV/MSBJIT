@@ -272,25 +272,6 @@ fn refresh_waiters(fibers: &mut [Fiber]) {
         }
     }
 }
-#[cfg(test)]
-mod scheduler_tests {
-    use super::*;
-
-    #[test]
-    fn finished_receivers_do_not_make_ready_callers_sleep() {
-        let mut caller = Fiber::new(1, 0, 0, 0);
-        caller.waiting.extend([2, 3]);
-        let mut finished = Fiber::new(2, 0, 0, 0);
-        finished.done = true;
-        let restarted = Fiber::new(3, 0, 0, 0);
-        let mut fibers = vec![caller, finished, restarted];
-        refresh_waiters(&mut fibers);
-        assert_eq!(fibers[0].waiting, HashSet::from([3]));
-        fibers.pop();
-        refresh_waiters(&mut fibers);
-        assert!(fibers[0].waiting.is_empty());
-    }
-}
 /// Stable prefix shared with the JIT. Variable and list-view buffers never
 /// resize; helpers refresh list data pointers and current argument pointers.
 #[repr(C)]
@@ -1089,4 +1070,24 @@ pub(crate) extern "C" fn rt_action(vm: &mut Vm, op: u32, a: u64, b: u64) {
         }
     }
     vm.publish_sprite(target);
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+
+    #[test]
+    fn finished_receivers_do_not_make_ready_callers_sleep() {
+        let mut caller = Fiber::new(1, 0, 0, 0);
+        caller.waiting.extend([2, 3]);
+        let mut finished = Fiber::new(2, 0, 0, 0);
+        finished.done = true;
+        let restarted = Fiber::new(3, 0, 0, 0);
+        let mut fibers = vec![caller, finished, restarted];
+        refresh_waiters(&mut fibers);
+        assert_eq!(fibers[0].waiting, HashSet::from([3]));
+        fibers.pop();
+        refresh_waiters(&mut fibers);
+        assert!(fibers[0].waiting.is_empty());
+    }
 }

@@ -403,6 +403,86 @@ fn numeric_fast_path_handles_negative_numbers_booleans_and_nan() {
     assert_eq!(value(&r, "n"), &ScratchValue::Number(-5.0));
 }
 #[test]
+fn native_math_boolean_and_comparison_reporters_preserve_coercions() {
+    let cases = [
+        (
+            json!({"opcode":"operator_mathop","fields":{"OPERATOR":["abs",null]},"inputs":{"NUM":[1,[4,"-3.2"]]}}),
+            ScratchValue::Number(3.2),
+        ),
+        (
+            json!({"opcode":"operator_mathop","fields":{"OPERATOR":["floor",null]},"inputs":{"NUM":[1,[4,"-3.2"]]}}),
+            ScratchValue::Number(-4.0),
+        ),
+        (
+            json!({"opcode":"operator_mathop","fields":{"OPERATOR":["ceiling",null]},"inputs":{"NUM":[1,[10,"-3.2"]]}}),
+            ScratchValue::Number(-3.0),
+        ),
+        (
+            json!({"opcode":"operator_mathop","fields":{"OPERATOR":["sqrt",null]},"inputs":{"NUM":[1,[4,"81"]]}}),
+            ScratchValue::Number(9.0),
+        ),
+        (
+            json!({"opcode":"operator_round","inputs":{"NUM":[1,[4,"-1.5"]]}}),
+            ScratchValue::Number(-1.0),
+        ),
+        (
+            json!({"opcode":"operator_lt","inputs":{"OPERAND1":[1,[4,"-2"]],"OPERAND2":[1,[4,"1"]]}}),
+            ScratchValue::Boolean(true),
+        ),
+        (
+            json!({"opcode":"operator_gt","inputs":{"OPERAND1":[1,[4,"-2"]],"OPERAND2":[1,[4,"1"]]}}),
+            ScratchValue::Boolean(false),
+        ),
+        (
+            json!({"opcode":"operator_equals","inputs":{"OPERAND1":[1,[4,"0"]],"OPERAND2":[1,[10," "]]}}),
+            ScratchValue::Boolean(false),
+        ),
+        (
+            json!({"opcode":"operator_not","inputs":{"OPERAND":[1,[10,"FALSE"]]}}),
+            ScratchValue::Boolean(true),
+        ),
+        (
+            json!({"opcode":"operator_and","inputs":{"OPERAND1":[2,"truth"],"OPERAND2":[1,[4,"-1"]]}}),
+            ScratchValue::Boolean(true),
+        ),
+        (
+            json!({"opcode":"operator_or","inputs":{"OPERAND1":[1,[4,"0"]],"OPERAND2":[1,[10,"0"]]}}),
+            ScratchValue::Boolean(false),
+        ),
+    ];
+    let mut blocks = json!({
+        "hat":{"opcode":"event_whenflagclicked","topLevel":true,"next":"set0"},
+        "truth":{"opcode":"operator_equals","inputs":{"OPERAND1":[1,[4,"1"]],"OPERAND2":[1,[4,"1"]]}}
+    });
+    let mut p = project(json!({}));
+    // Build one straight-line project so both fast and coercing paths execute
+    // in the same native function, with each result independently observable.
+    for (i, (reporter, _)) in cases.iter().enumerate() {
+        let id = format!("case{i}");
+        p.targets[0]
+            .variables
+            .insert(id.clone(), (id.clone(), ScratchValue::Number(0.0)));
+        blocks[format!("reporter{i}")] = reporter.clone();
+        let mut set = json!({"opcode":"data_setvariableto","fields":{"VARIABLE":[id,id]},"inputs":{"VALUE":[2,format!("reporter{i}")]}});
+        if i + 1 < cases.len() {
+            set["next"] = json!(format!("set{}", i + 1));
+        }
+        blocks[format!("set{i}")] = set;
+    }
+    p.targets[0].blocks = serde_json::from_value(blocks).unwrap();
+    let report = runtime::spawn(Arc::new(p), RuntimeOptions::default())
+        .unwrap()
+        .join()
+        .unwrap();
+    for (i, (_, expected)) in cases.iter().enumerate() {
+        assert_eq!(
+            value(&report, &format!("case{i}")),
+            expected,
+            "reporter {i}"
+        );
+    }
+}
+#[test]
 fn restarted_broadcast_receiver_keeps_waiters_suspended() {
     let r = run(
         json!({
