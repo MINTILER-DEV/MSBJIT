@@ -214,6 +214,10 @@ impl Program {
                 l.program.scripts.push(Script { target, entry, hat });
             }
         }
+        // Only string handles are GC roots; constants never change at runtime.
+        l.program
+            .constants
+            .retain(|v| v & 0xffff_0000_0000_0000 == crate::value::STRING_TAG);
         Ok(l.program)
     }
 }

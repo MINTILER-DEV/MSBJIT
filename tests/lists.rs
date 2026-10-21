@@ -44,6 +44,51 @@ fn set(id: &str, reporter: &str) -> Value {
 fn value<'a>(r: &'a RunReport, id: &str) -> &'a ScratchValue {
     &r.variables.iter().find(|v| v.id == id).unwrap().value
 }
+#[test]
+fn native_list_views_follow_reallocations_and_string_transitions() {
+    let mut commands = vec![];
+    for i in 0..40 {
+        commands.push(list(
+            "data_addtolist",
+            json!({"ITEM":[1,[4,i.to_string()]]}),
+        ));
+    }
+    commands.extend([
+        list(
+            "data_replaceitemoflist",
+            json!({"INDEX":[1,[4,"40.9"]],"ITEM":[2,"joined"]}),
+        ),
+        json!({"opcode":"control_wait","inputs":{"DURATION":[1,[4,"0"]]}}),
+        set("out", "last"),
+        list(
+            "data_replaceitemoflist",
+            json!({"INDEX":[1,[4,"40"]],"ITEM":[1,[4,"123"]]}),
+        ),
+        list(
+            "data_insertatlist",
+            json!({"INDEX":[1,[4,"1"]],"ITEM":[1,[4,"-1"]]}),
+        ),
+        list("data_deleteoflist", json!({"INDEX":[1,[4,"1"]]})),
+        set("n", "last"),
+        list("data_deletealloflist", json!({})),
+        list("data_addtolist", json!({"ITEM":[1,[4,"77"]]})),
+        set("bad", "first"),
+    ]);
+    let r = run(
+        commands,
+        json!({
+            "joined":{"opcode":"operator_join","inputs":{"STRING1":[1,[10,"new"]],"STRING2":[1,[10," string"]]}},
+            "last":list("data_itemoflist",json!({"INDEX":[1,[4,"40.9"]]})),
+            "first":list("data_itemoflist",json!({"INDEX":[1,[4,"1"]]}))
+        }),
+        json!([]),
+        true,
+    );
+    assert_eq!(value(&r, "out"), &ScratchValue::String("new string".into()));
+    assert_eq!(value(&r, "n"), &ScratchValue::Number(123.0));
+    assert_eq!(value(&r, "bad"), &ScratchValue::Number(77.0));
+    assert_eq!(r.lists[0].items, vec![ScratchValue::Number(77.0)]);
+}
 
 #[test]
 fn list_mutations_and_reporters_execute_native_code() {

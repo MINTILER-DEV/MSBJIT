@@ -29,6 +29,52 @@ fn run(blocks: Value, turbo: bool) -> RunReport {
 fn value<'a>(report: &'a RunReport, id: &str) -> &'a ScratchValue {
     &report.variables.iter().find(|v| v.id == id).unwrap().value
 }
+#[test]
+fn sampled_checkpoints_preserve_exact_step_limits() {
+    let p = Arc::new(project(json!({
+        "hat":{"opcode":"event_whenflagclicked","topLevel":true,"next":"loop"},
+        "loop":{"opcode":"control_forever","inputs":{"SUBSTACK":[2,"inc"]}},
+        "inc":{"opcode":"data_changevariableby","fields":{"VARIABLE":["counter","n"]},"inputs":{"VALUE":[1,[4,"1"]]}}
+    })));
+    for limit in [0, 1, 2, 63, 64, 65, 127, 128, 129, 1025] {
+        let r = runtime::spawn(
+            p.clone(),
+            RuntimeOptions {
+                turbo: true,
+                max_steps: Some(limit),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .join()
+        .unwrap();
+        assert_eq!(r.steps, limit, "limit {limit}");
+        assert!(r.interrupted);
+    }
+}
+
+#[test]
+fn reused_procedure_arguments_survive_yields_and_collection() {
+    let r = run(
+        json!({
+            "hat":{"opcode":"event_whenflagclicked","topLevel":true,"next":"loop"},
+            "loop":{"opcode":"control_repeat","inputs":{"TIMES":[1,[6,"140"]],"SUBSTACK":[2,"call"]}},
+            "call":{"opcode":"procedures_call","mutation":{"proccode":"save %s %s","argumentids":"[\"a\",\"b\"]"},"inputs":{"a":[2,"join"],"b":[3,[12,"counter","n"],[4,"0"]]},"next":"inc"},
+            "join":{"opcode":"operator_join","inputs":{"STRING1":[1,[10,"v"]],"STRING2":[3,[12,"counter","n"],[10,""]]}},
+            "inc":{"opcode":"data_changevariableby","fields":{"VARIABLE":["counter","n"]},"inputs":{"VALUE":[1,[4,"1"]]}},
+            "def":{"opcode":"procedures_definition","topLevel":true,"inputs":{"custom_block":[1,"proto"]},"next":"wait"},
+            "proto":{"opcode":"procedures_prototype","mutation":{"proccode":"save %s %s","argumentids":"[\"a\",\"b\"]","argumentnames":"[\"text\",\"index\"]","argumentdefaults":"[\"\",0]","warp":"false"}},
+            "wait":{"opcode":"control_wait","inputs":{"DURATION":[1,[4,"0"]]},"next":"set"},
+            "arg":{"opcode":"argument_reporter_string_number","fields":{"VALUE":["text",null]}},
+            "index":{"opcode":"argument_reporter_string_number","fields":{"VALUE":["index",null]}},
+            "suffix":{"opcode":"operator_join","inputs":{"STRING1":[2,"arg"],"STRING2":[2,"index"]}},
+            "set":{"opcode":"data_setvariableto","fields":{"VARIABLE":["text","s"]},"inputs":{"VALUE":[2,"suffix"]}}
+        }),
+        true,
+    );
+    assert_eq!(value(&r, "n"), &ScratchValue::Number(140.0));
+    assert_eq!(value(&r, "s"), &ScratchValue::String("v139139".into()));
+}
 fn warp_project(body: Value) -> Value {
     let mut blocks = json!({
         "hat":{"opcode":"event_whenflagclicked","topLevel":true,"next":"call"},

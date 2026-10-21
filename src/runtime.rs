@@ -2,6 +2,7 @@ use crate::{
     input::{InputController, InputEvent, InputState},
     ir::{Hat, Program},
     jit::NativeProgram,
+    lists::{ListView, RuntimeList},
     pen::{PenCanvas, PenState},
     project::Project,
     value::{ScratchValue, number},
@@ -263,13 +264,55 @@ enum Event {
     StopOthers,
     StopAll,
 }
+fn refresh_waiters(fibers: &mut [Fiber]) {
+    if fibers.iter().any(|f| !f.waiting.is_empty()) {
+        let alive: HashSet<_> = fibers.iter().filter(|f| !f.done).map(|f| f.id).collect();
+        for fiber in fibers {
+            fiber.waiting.retain(|id| alive.contains(id));
+        }
+    }
+}
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+
+    #[test]
+    fn finished_receivers_do_not_make_ready_callers_sleep() {
+        let mut caller = Fiber::new(1, 0, 0, 0);
+        caller.waiting.extend([2, 3]);
+        let mut finished = Fiber::new(2, 0, 0, 0);
+        finished.done = true;
+        let restarted = Fiber::new(3, 0, 0, 0);
+        let mut fibers = vec![caller, finished, restarted];
+        refresh_waiters(&mut fibers);
+        assert_eq!(fibers[0].waiting, HashSet::from([3]));
+        fibers.pop();
+        refresh_waiters(&mut fibers);
+        assert!(fibers[0].waiting.is_empty());
+    }
+}
+/// Stable prefix shared with the JIT. Variable and list-view buffers never
+/// resize; helpers refresh list data pointers and current argument pointers.
+#[repr(C)]
+pub(crate) struct JitState {
+    pub vars: *mut u64,
+    pub lists: *mut ListView,
+    pub args: *const u64,
+    pub steps: u64,
+    pub budget: u32,
+    pub pc: u32,
+    pub yield_on_loop: u32,
+}
+#[repr(C)]
 pub(crate) struct Vm {
+    jit: JitState,
     input: InputState,
     interactive: bool,
     project: Arc<Project>,
     program: Program,
     vars: Vec<u64>,
-    lists: Vec<Vec<u64>>,
+    lists: Vec<RuntimeList>,
+    list_views: Vec<ListView>,
     pens: Vec<PenState>,
     current: Fiber,
     sprites: Vec<SpriteState>,
@@ -277,12 +320,12 @@ pub(crate) struct Vm {
     options: RuntimeOptions,
     events: Vec<Event>,
     call_args: Vec<u64>,
+    spare_frames: Vec<Frame>,
     messages: VecDeque<String>,
     start: Instant,
     timer: Instant,
     slice_start: Instant,
     warp_start: Option<Instant>,
-    steps: u64,
     yields: u64,
     ticks: u64,
     error: Option<String>,
@@ -296,11 +339,29 @@ impl Vm {
         shared: Arc<SharedScene>,
     ) -> Self {
         let now = Instant::now();
+        let mut vars = program.initial_variables.clone();
+        let mut lists: Vec<_> = program
+            .initial_lists
+            .iter()
+            .cloned()
+            .map(RuntimeList::new)
+            .collect();
+        let mut list_views: Vec<_> = lists.iter_mut().map(RuntimeList::view).collect();
         Self {
+            jit: JitState {
+                vars: vars.as_mut_ptr(),
+                lists: list_views.as_mut_ptr(),
+                args: std::ptr::null(),
+                steps: 0,
+                budget: 0,
+                pc: 0,
+                yield_on_loop: 0,
+            },
             input: InputState::default(),
             interactive: false,
-            vars: program.initial_variables.clone(),
-            lists: program.initial_lists.clone(),
+            vars,
+            lists,
+            list_views,
             pens: vec![PenState::default(); project.targets.len()],
             current: Fiber::new(0, 0, 0, program.loop_slots),
             sprites: shared.snapshot(&project),
@@ -310,12 +371,12 @@ impl Vm {
             options,
             events: vec![],
             call_args: vec![],
+            spare_frames: vec![],
             messages: VecDeque::new(),
             start: now,
             timer: now,
             slice_start: now,
             warp_start: None,
-            steps: 0,
             yields: 0,
             ticks: 0,
             error: None,
@@ -342,7 +403,7 @@ impl Vm {
         for id in 0..self.sprites.len() {
             self.publish_sprite(id);
         }
-        self.shared.steps.store(self.steps, Ordering::Relaxed);
+        self.shared.steps.store(self.jit.steps, Ordering::Relaxed);
     }
     fn run(&mut self, native: &NativeProgram) -> Result<RunReport> {
         let mut fibers: Vec<Fiber> = self
@@ -410,8 +471,13 @@ impl Vm {
                 if self.shared.stopped.load(Ordering::Relaxed) || self.limit_reached() {
                     break;
                 }
-                let alive: HashSet<u64> = fibers.iter().filter(|f| !f.done).map(|f| f.id).collect();
-                fibers[index].waiting.retain(|id| alive.contains(id));
+                // Most scripts have no dependencies. Avoid allocating a set of
+                // every fiber on each dispatch just to check an empty wait set.
+                if !fibers[index].waiting.is_empty() {
+                    let mut waiting = std::mem::take(&mut fibers[index].waiting);
+                    waiting.retain(|id| fibers.iter().any(|f| !f.done && f.id == *id));
+                    fibers[index].waiting = waiting;
+                }
                 if fibers[index].done
                     || !fibers[index].waiting.is_empty()
                     || fibers[index].wake.is_some_and(|w| w > Instant::now())
@@ -419,12 +485,16 @@ impl Vm {
                     index += 1;
                     continue;
                 }
-                let placeholder = Fiber::new(0, 0, 0, 0);
-                self.current = std::mem::replace(&mut fibers[index], placeholder);
+                std::mem::swap(&mut self.current, &mut fibers[index]);
                 self.current.wake = None;
                 self.slice_start = Instant::now();
                 self.warp_start = self.current.warp().then(Instant::now);
+                self.jit.args = self.current.frames.last().unwrap().args.as_ptr();
+                self.jit.budget = 0;
+                self.jit.pc = self.current.pc as u32;
+                self.jit.yield_on_loop = u32::from(!self.current.warp() && !self.options.turbo);
                 native.execute(self);
+                self.current.pc = self.jit.pc as usize;
                 self.yields += u64::from(!self.current.done);
                 for event in std::mem::take(&mut self.events) {
                     match event {
@@ -484,7 +554,7 @@ impl Vm {
                         }
                     }
                 }
-                fibers[index] = std::mem::replace(&mut self.current, Fiber::new(0, 0, 0, 0));
+                std::mem::swap(&mut self.current, &mut fibers[index]);
                 self.publish();
                 if let Some(error) = self.error.take() {
                     return Err(anyhow!(error));
@@ -493,13 +563,14 @@ impl Vm {
                 dispatched += 1;
             }
             fibers.retain(|f| !f.done);
+            refresh_waiters(&mut fibers);
             let roots =
                 self.program
                     .constants
                     .iter()
                     .copied()
                     .chain(self.vars.iter().copied())
-                    .chain(self.lists.iter().flatten().copied())
+                    .chain(self.lists.iter().flat_map(RuntimeList::roots))
                     .chain(fibers.iter().flat_map(|f| {
                         f.frames.iter().flat_map(|frame| frame.args.iter().copied())
                     }));
@@ -528,7 +599,7 @@ impl Vm {
         }
         self.publish();
         Ok(RunReport {
-            steps: self.steps,
+            steps: self.jit.steps,
             yields: self.yields,
             ticks: self.ticks,
             elapsed_seconds: self.start.elapsed().as_secs_f64(),
@@ -568,7 +639,7 @@ impl Vm {
         self.options
             .time_limit
             .is_some_and(|d| self.start.elapsed() >= d)
-            || self.options.max_steps.is_some_and(|s| self.steps >= s)
+            || self.options.max_steps.is_some_and(|s| self.jit.steps >= s)
     }
     fn sleep_until(&self, deadline: Instant) {
         while Instant::now() < deadline
@@ -584,16 +655,15 @@ impl Vm {
     fn fail(&mut self, message: &str) {
         self.error = Some(message.into());
         self.current.done = true;
+        self.jit.budget = 0;
     }
 }
 // These functions have a C ABI and are only registered inside our JIT module.
 // Their pointer argument is always a live, exclusively borrowed Vm supplied by
 // NativeProgram::execute. None may unwind through generated machine code.
-pub(crate) extern "C" fn rt_pc(vm: &mut Vm) -> u32 {
-    vm.current.pc as u32
-}
 pub(crate) extern "C" fn rt_checkpoint(vm: &mut Vm, pc: u32) -> u32 {
     vm.current.pc = pc as usize;
+    vm.jit.pc = pc;
     if vm.current.done || vm.error.is_some() {
         return 1;
     }
@@ -615,27 +685,18 @@ pub(crate) extern "C" fn rt_checkpoint(vm: &mut Vm, pc: u32) -> u32 {
             return 1;
         }
     }
-    vm.steps += 1;
-    if vm.steps & 1023 == 0 {
-        vm.shared.steps.store(vm.steps, Ordering::Relaxed);
-    }
+    vm.shared.steps.store(vm.jit.steps, Ordering::Relaxed);
+    vm.jit.budget = vm
+        .options
+        .max_steps
+        .map_or(64, |limit| (limit - vm.jit.steps).min(64) as u32);
     0
-}
-pub(crate) extern "C" fn rt_boundary(vm: &mut Vm, next: u32) -> u32 {
-    vm.current.pc = next as usize;
-    u32::from(!vm.current.warp() && !vm.options.turbo)
 }
 pub(crate) extern "C" fn rt_number(vm: &mut Vm, value: u64) -> f64 {
     vm.value(value).to_number()
 }
 pub(crate) extern "C" fn rt_bool(vm: &mut Vm, value: u64) -> u32 {
     u32::from(vm.value(value).to_bool())
-}
-pub(crate) extern "C" fn rt_get(vm: &mut Vm, slot: u32) -> u64 {
-    vm.vars[slot as usize]
-}
-pub(crate) extern "C" fn rt_set(vm: &mut Vm, slot: u32, value: u64) {
-    vm.vars[slot as usize] = value;
 }
 fn list_index(value: &ScratchValue, length: usize, random: &mut u64) -> Option<usize> {
     let index = match value {
@@ -689,7 +750,7 @@ pub(crate) extern "C" fn rt_list(vm: &mut Vm, op: u32, slot: u32, a: u64, b: u64
         }
         4 => {
             if let Some(index) = list_index(&arg, length, &mut vm.random) {
-                vm.lists[slot][index] = b;
+                vm.lists[slot].replace(index, b);
             }
             ScratchValue::Number(0.0)
         }
@@ -728,13 +789,12 @@ pub(crate) extern "C" fn rt_list(vm: &mut Vm, op: u32, slot: u32, a: u64, b: u64
         }
         _ => ScratchValue::Number(0.0),
     };
+    vm.list_views[slot] = vm.lists[slot].view();
     vm.program.values.encode(result)
 }
-pub(crate) extern "C" fn rt_arg(vm: &mut Vm, slot: u32) -> u64 {
-    vm.current.frames.last().unwrap().args[slot as usize]
-}
-pub(crate) extern "C" fn rt_push_arg(vm: &mut Vm, value: u64) {
-    vm.call_args.push(value);
+pub(crate) extern "C" fn rt_call_args(vm: &mut Vm, count: u32) -> *mut u64 {
+    vm.call_args.resize(count as usize, 0);
+    vm.call_args.as_mut_ptr()
 }
 pub(crate) extern "C" fn rt_call(vm: &mut Vm, procedure: u32, next: u32) -> u32 {
     if vm.current.frames.len() >= 1024 {
@@ -743,22 +803,44 @@ pub(crate) extern "C" fn rt_call(vm: &mut Vm, procedure: u32, next: u32) -> u32 
     }
     let p = &vm.program.procedures[procedure as usize];
     let warp = p.warp || vm.current.warp();
+    if warp != vm.current.warp() {
+        vm.jit.budget = 0;
+    }
     vm.current.pc = p.entry;
-    vm.current.frames.push(Frame {
-        return_pc: next as usize,
-        warp,
-        args: std::mem::take(&mut vm.call_args),
-        loops: vec![0.0; vm.program.loop_slots],
+    vm.jit.pc = p.entry as u32;
+    vm.jit.yield_on_loop = u32::from(!warp && !vm.options.turbo);
+    let mut frame = vm.spare_frames.pop().unwrap_or(Frame {
+        return_pc: 0,
+        warp: false,
+        args: vec![],
+        loops: vec![],
     });
+    frame.return_pc = next as usize;
+    frame.warp = warp;
+    frame.args.clear();
+    frame.args.extend_from_slice(&vm.call_args);
+    vm.call_args.clear();
+    frame.loops.resize(vm.program.loop_slots, 0.0);
+    frame.loops.fill(0.0);
+    vm.jit.args = frame.args.as_ptr();
+    vm.current.frames.push(frame);
     0
 }
 pub(crate) extern "C" fn rt_return(vm: &mut Vm) -> u32 {
-    let frame = vm.current.frames.pop().unwrap();
+    let mut frame = vm.current.frames.pop().unwrap();
     if vm.current.frames.is_empty() {
         vm.current.done = true;
         1
     } else {
         vm.current.pc = frame.return_pc;
+        vm.jit.pc = frame.return_pc as u32;
+        vm.jit.yield_on_loop = u32::from(!vm.current.warp() && !vm.options.turbo);
+        if frame.warp != vm.current.warp() {
+            vm.jit.budget = 0;
+        }
+        vm.jit.args = vm.current.frames.last().unwrap().args.as_ptr();
+        frame.args.clear();
+        vm.spare_frames.push(frame);
         0
     }
 }
@@ -779,6 +861,7 @@ pub(crate) extern "C" fn rt_wait(vm: &mut Vm, seconds: f64, next: u32) {
     };
     vm.current.wake = Some(Instant::now() + Duration::from_secs_f64(seconds));
     vm.current.pc = next as usize;
+    vm.jit.pc = next;
 }
 pub(crate) extern "C" fn rt_broadcast(vm: &mut Vm, name: u64, wait: u32, next: u32) {
     if vm.events.len() >= 4096 {
@@ -790,6 +873,7 @@ pub(crate) extern "C" fn rt_broadcast(vm: &mut Vm, name: u64, wait: u32, next: u
         wait: wait != 0,
     });
     vm.current.pc = next as usize;
+    vm.jit.pc = next;
 }
 pub(crate) extern "C" fn rt_stop(vm: &mut Vm, mode: u32) {
     match mode {

@@ -3,6 +3,7 @@ pub mod desktop;
 pub mod input;
 mod ir;
 mod jit;
+mod lists;
 mod pen;
 pub mod project;
 #[cfg(feature = "graphics")]

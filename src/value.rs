@@ -89,6 +89,7 @@ pub(crate) struct Values {
     strings: Vec<Option<String>>,
     interned: HashMap<String, usize>,
     free: Vec<usize>,
+    dirty: bool,
 }
 impl Values {
     pub fn encode(&mut self, value: ScratchValue) -> u64 {
@@ -99,6 +100,7 @@ impl Values {
                 let id = if let Some(id) = self.interned.get(&s) {
                     *id
                 } else {
+                    self.dirty = true;
                     let id = self.free.pop().unwrap_or(self.strings.len());
                     if id == self.strings.len() {
                         self.strings.push(Some(s.clone()));
@@ -125,6 +127,11 @@ impl Values {
         }
     }
     pub fn collect(&mut self, roots: impl Iterator<Item = u64>) {
+        // No new strings means no memory growth. In particular, numeric RAM
+        // operations and broadcast RPCs need no root walk or arena scan.
+        if !std::mem::take(&mut self.dirty) {
+            return;
+        }
         let live: HashSet<usize> = roots
             .filter(|v| v & 0xffff_0000_0000_0000 == STRING_TAG)
             .map(|v| (v & 0xffff_ffff) as usize)

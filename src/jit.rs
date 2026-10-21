@@ -10,6 +10,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module, default_libcall_names};
 use std::collections::HashMap;
+use std::mem::offset_of;
 
 pub(crate) struct NativeProgram {
     module: Option<JITModule>,
@@ -25,16 +26,9 @@ impl NativeProgram {
                 vec![types::I32, types::I32, types::I64, types::I64],
                 Some(types::I64),
             ),
-            ("pc", rt_pc as *const u8, vec![], Some(types::I32)),
             (
                 "checkpoint",
                 rt_checkpoint as *const u8,
-                vec![types::I32],
-                Some(types::I32),
-            ),
-            (
-                "boundary",
-                rt_boundary as *const u8,
                 vec![types::I32],
                 Some(types::I32),
             ),
@@ -51,24 +45,15 @@ impl NativeProgram {
                 Some(types::I32),
             ),
             (
-                "get",
-                rt_get as *const u8,
+                "call_args",
+                rt_call_args as *const u8,
                 vec![types::I32],
-                Some(types::I64),
+                Some(if usize::BITS == 64 {
+                    types::I64
+                } else {
+                    types::I32
+                }),
             ),
-            (
-                "set",
-                rt_set as *const u8,
-                vec![types::I32, types::I64],
-                None,
-            ),
-            (
-                "arg",
-                rt_arg as *const u8,
-                vec![types::I32],
-                Some(types::I64),
-            ),
-            ("push_arg", rt_push_arg as *const u8, vec![types::I64], None),
             (
                 "call",
                 rt_call as *const u8,
@@ -160,10 +145,29 @@ impl NativeProgram {
                 .into_iter()
                 .map(|(name, id)| (name, module.declare_func_in_func(id, b.func)))
                 .collect();
-            let mut e = Emitter { b, vm, funcs };
+            let vars = b.ins().load(
+                pointer,
+                ir::MemFlags::trusted(),
+                vm,
+                offset_of!(JitState, vars) as i32,
+            );
+            let lists = b.ins().load(
+                pointer,
+                ir::MemFlags::trusted(),
+                vm,
+                offset_of!(JitState, lists) as i32,
+            );
+            let mut e = Emitter {
+                b,
+                vm,
+                vars,
+                lists,
+                pointer,
+                funcs,
+            };
             e.b.ins().jump(dispatch, &[]);
             e.b.switch_to_block(dispatch);
-            let pc = e.call("pc", &[]).unwrap();
+            let pc = e.load(types::I32, offset_of!(JitState, pc));
             let mut switch = Switch::new();
             for (id, block) in blocks.iter().enumerate() {
                 switch.set_entry(id as u128, *block);
@@ -171,28 +175,29 @@ impl NativeProgram {
             switch.emit(&mut e.b, pc, exit);
             for (id, node) in program.nodes.iter().enumerate() {
                 e.b.switch_to_block(blocks[id]);
-                let pc = e.i32(id);
-                let stop = e.call("checkpoint", &[pc]).unwrap();
-                let body = e.b.create_block();
-                e.b.ins().brif(stop, exit, &[], body, &[]);
-                e.b.switch_to_block(body);
+                e.checkpoint(id, exit);
                 let next = blocks[node.next];
                 match &node.op {
                     Op::Set(slot, x) => {
                         let x = e.expr(x);
-                        let slot = e.i32(*slot);
-                        e.call("set", &[slot, x]);
+                        e.b.ins()
+                            .store(ir::MemFlags::trusted(), x, e.vars, (*slot * 8) as i32);
                         e.b.ins().jump(next, &[]);
                     }
                     Op::Change(slot, x) => {
                         let x = e.expr(x);
                         let x = e.num(x);
-                        let slot = e.i32(*slot);
-                        let old = e.call("get", &[slot]).unwrap();
+                        let old = e.b.ins().load(
+                            types::I64,
+                            ir::MemFlags::trusted(),
+                            e.vars,
+                            (*slot * 8) as i32,
+                        );
                         let old = e.num(old);
                         let sum = e.b.ins().fadd(old, x);
                         let bits = e.bits(sum);
-                        e.call("set", &[slot, bits]);
+                        e.b.ins()
+                            .store(ir::MemFlags::trusted(), bits, e.vars, (*slot * 8) as i32);
                         e.b.ins().jump(next, &[]);
                     }
                     Op::Action(op, a, b) => {
@@ -205,14 +210,12 @@ impl NativeProgram {
                     Op::List(op, slot, a, b) => {
                         let a = e.expr(a);
                         let b = e.expr(b);
-                        let op = e.i32(*op as usize);
-                        let slot = e.i32(*slot);
-                        e.call("list", &[op, slot, a, b]);
+                        e.list(*op, *slot, a, b);
                         e.b.ins().jump(next, &[]);
                     }
                     Op::Branch(c, yes, no) => {
                         let c = e.expr(c);
-                        let c = e.call("bool", &[c]).unwrap();
+                        let c = e.truthy(c);
                         e.b.ins().brif(c, blocks[*yes], &[], blocks[*no], &[]);
                     }
                     Op::Jump(to, boundary) => {
@@ -265,9 +268,18 @@ impl NativeProgram {
                         e.b.ins().jump(if *wait { exit } else { next }, &[]);
                     }
                     Op::Call(proc, args) => {
-                        for a in args {
-                            let a = e.expr(a);
-                            e.call("push_arg", &[a]);
+                        let values: Vec<_> = args.iter().map(|a| e.expr(a)).collect();
+                        if !values.is_empty() {
+                            let count = e.i32(values.len());
+                            let data = e.call("call_args", &[count]).unwrap();
+                            for (i, value) in values.into_iter().enumerate() {
+                                e.b.ins().store(
+                                    ir::MemFlags::trusted(),
+                                    value,
+                                    data,
+                                    (i * 8) as i32,
+                                );
+                            }
                         }
                         let proc = e.i32(*proc);
                         let pc = e.i32(node.next);
@@ -282,7 +294,7 @@ impl NativeProgram {
                         let mode = e.i32(*mode as usize);
                         e.call("stop", &[mode]);
                         let pc = e.i32(node.next);
-                        e.call("boundary", &[pc]);
+                        e.store(pc, offset_of!(JitState, pc));
                         e.b.ins().jump(exit, &[]);
                     }
                 }
@@ -326,9 +338,200 @@ impl Drop for NativeProgram {
 struct Emitter<'a> {
     b: FunctionBuilder<'a>,
     vm: ir::Value,
+    vars: ir::Value,
+    lists: ir::Value,
+    pointer: ir::Type,
     funcs: HashMap<&'static str, ir::FuncRef>,
 }
 impl Emitter<'_> {
+    fn load(&mut self, ty: ir::Type, offset: usize) -> ir::Value {
+        self.b
+            .ins()
+            .load(ty, ir::MemFlags::trusted(), self.vm, offset as i32)
+    }
+    fn store(&mut self, value: ir::Value, offset: usize) {
+        self.b
+            .ins()
+            .store(ir::MemFlags::trusted(), value, self.vm, offset as i32);
+    }
+    fn checkpoint(&mut self, pc: usize, exit: ir::Block) {
+        let budget = self.load(types::I32, offset_of!(JitState, budget));
+        let empty = self
+            .b
+            .ins()
+            .icmp_imm(ir::condcodes::IntCC::Equal, budget, 0);
+        let slow = self.b.create_block();
+        let ready = self.b.create_block();
+        self.b.ins().brif(empty, slow, &[], ready, &[]);
+        self.b.switch_to_block(slow);
+        let pc = self.i32(pc);
+        let stop = self.call("checkpoint", &[pc]).unwrap();
+        self.b.ins().brif(stop, exit, &[], ready, &[]);
+        self.b.switch_to_block(ready);
+        let budget = self.load(types::I32, offset_of!(JitState, budget));
+        let budget = self.b.ins().iadd_imm(budget, -1);
+        self.store(budget, offset_of!(JitState, budget));
+        let steps = self.load(types::I64, offset_of!(JitState, steps));
+        let steps = self.b.ins().iadd_imm(steps, 1);
+        self.store(steps, offset_of!(JitState, steps));
+    }
+    fn boxed(&mut self, value: ir::Value) -> ir::Value {
+        let tag = self
+            .b
+            .ins()
+            .band_imm(value, 0xfffe_0000_0000_0000u64 as i64);
+        self.b.ins().icmp_imm(
+            ir::condcodes::IntCC::Equal,
+            tag,
+            crate::value::STRING_TAG as i64,
+        )
+    }
+    fn raw_num(&mut self, bits: ir::Value) -> ir::Value {
+        let n = self.b.ins().bitcast(types::F64, ir::MemFlags::new(), bits);
+        let nan = self.b.ins().fcmp(ir::condcodes::FloatCC::Unordered, n, n);
+        let zero = self.b.ins().f64const(0.0);
+        self.b.ins().select(nan, zero, n)
+    }
+    fn boolean(&mut self, value: ir::Value) -> ir::Value {
+        let value = self.b.ins().uextend(types::I64, value);
+        self.b.ins().bor_imm(value, crate::value::BOOL_TAG as i64)
+    }
+    fn truthy(&mut self, value: ir::Value) -> ir::Value {
+        let tag = self
+            .b
+            .ins()
+            .band_imm(value, 0xffff_0000_0000_0000u64 as i64);
+        let string = self.b.ins().icmp_imm(
+            ir::condcodes::IntCC::Equal,
+            tag,
+            crate::value::STRING_TAG as i64,
+        );
+        let slow = self.b.create_block();
+        let other = self.b.create_block();
+        let bool_block = self.b.create_block();
+        let number = self.b.create_block();
+        let join = self.b.create_block();
+        self.b.append_block_param(join, types::I32);
+        self.b.ins().brif(string, slow, &[], other, &[]);
+        self.b.switch_to_block(slow);
+        let result = self.call("bool", &[value]).unwrap();
+        self.b.ins().jump(join, &[result.into()]);
+        self.b.switch_to_block(other);
+        let boolean = self.b.ins().icmp_imm(
+            ir::condcodes::IntCC::Equal,
+            tag,
+            crate::value::BOOL_TAG as i64,
+        );
+        self.b.ins().brif(boolean, bool_block, &[], number, &[]);
+        self.b.switch_to_block(bool_block);
+        let result = self.b.ins().band_imm(value, 1);
+        let result = self.b.ins().ireduce(types::I32, result);
+        self.b.ins().jump(join, &[result.into()]);
+        self.b.switch_to_block(number);
+        let n = self.raw_num(value);
+        let zero = self.b.ins().f64const(0.0);
+        let result = self.b.ins().fcmp(ir::condcodes::FloatCC::NotEqual, n, zero);
+        let result = self.b.ins().uextend(types::I32, result);
+        self.b.ins().jump(join, &[result.into()]);
+        self.b.switch_to_block(join);
+        self.b.block_params(join)[0]
+    }
+    fn list(&mut self, op: u32, slot: usize, index: ir::Value, item: ir::Value) -> ir::Value {
+        use crate::lists::ListView;
+        let base = slot * std::mem::size_of::<ListView>();
+        if op == 6 {
+            let len = self.b.ins().load(
+                self.pointer,
+                ir::MemFlags::trusted(),
+                self.lists,
+                (base + offset_of!(ListView, len)) as i32,
+            );
+            let len = self.b.ins().fcvt_from_uint(types::F64, len);
+            return self.bits(len);
+        }
+        if op != 4 && op != 5 {
+            let op = self.i32(op as usize);
+            let slot = self.i32(slot);
+            return self.call("list", &[op, slot, index, item]).unwrap();
+        }
+        let slow = self.b.create_block();
+        let numeric = self.b.create_block();
+        let valid = self.b.create_block();
+        let join = self.b.create_block();
+        self.b.append_block_param(join, types::I64);
+        let boxed = self.boxed(index);
+        self.b.ins().brif(boxed, slow, &[], numeric, &[]);
+        self.b.switch_to_block(numeric);
+        let n = self.b.ins().bitcast(types::F64, ir::MemFlags::new(), index);
+        let n = self.b.ins().floor(n);
+        let len = self.b.ins().load(
+            self.pointer,
+            ir::MemFlags::trusted(),
+            self.lists,
+            (base + offset_of!(ListView, len)) as i32,
+        );
+        let len = self.b.ins().fcvt_from_uint(types::F64, len);
+        let one = self.b.ins().f64const(1.0);
+        let lower = self
+            .b
+            .ins()
+            .fcmp(ir::condcodes::FloatCC::GreaterThanOrEqual, n, one);
+        let upper = self
+            .b
+            .ins()
+            .fcmp(ir::condcodes::FloatCC::LessThanOrEqual, n, len);
+        let in_bounds = self.b.ins().band(lower, upper);
+        self.b.ins().brif(in_bounds, valid, &[], slow, &[]);
+        self.b.switch_to_block(valid);
+        let at = self.b.ins().fcvt_to_uint_sat(self.pointer, n);
+        let at = self.b.ins().iadd_imm(at, -1);
+        let at = self.b.ins().ishl_imm(at, 3);
+        let data = self.b.ins().load(
+            self.pointer,
+            ir::MemFlags::trusted(),
+            self.lists,
+            (base + offset_of!(ListView, data)) as i32,
+        );
+        let address = self.b.ins().iadd(data, at);
+        let old = self
+            .b
+            .ins()
+            .load(types::I64, ir::MemFlags::trusted(), address, 0);
+        if op == 5 {
+            self.b.ins().jump(join, &[old.into()]);
+        } else {
+            let old_tag = self.b.ins().band_imm(old, 0xffff_0000_0000_0000u64 as i64);
+            let new_tag = self.b.ins().band_imm(item, 0xffff_0000_0000_0000u64 as i64);
+            let old_string = self.b.ins().icmp_imm(
+                ir::condcodes::IntCC::Equal,
+                old_tag,
+                crate::value::STRING_TAG as i64,
+            );
+            let new_string = self.b.ins().icmp_imm(
+                ir::condcodes::IntCC::Equal,
+                new_tag,
+                crate::value::STRING_TAG as i64,
+            );
+            let needs_roots = self.b.ins().bor(old_string, new_string);
+            let write = self.b.create_block();
+            self.b.ins().brif(needs_roots, slow, &[], write, &[]);
+            self.b.switch_to_block(write);
+            self.b
+                .ins()
+                .store(ir::MemFlags::trusted(), item, address, 0);
+            let zero = self.b.ins().iconst(types::I64, 0);
+            self.b.ins().jump(join, &[zero.into()]);
+        }
+        self.b.switch_to_block(slow);
+        let op_value = self.i32(op as usize);
+        let slot_value = self.i32(slot);
+        let result = self
+            .call("list", &[op_value, slot_value, index, item])
+            .unwrap();
+        self.b.ins().jump(join, &[result.into()]);
+        self.b.switch_to_block(join);
+        self.b.block_params(join)[0]
+    }
     fn i32(&mut self, n: usize) -> ir::Value {
         self.b.ins().iconst(types::I32, n as i64)
     }
@@ -369,19 +572,27 @@ impl Emitter<'_> {
     }
     fn boundary(&mut self, pc: usize, to: ir::Block, exit: ir::Block) {
         let pc = self.i32(pc);
-        let stop = self.call("boundary", &[pc]).unwrap();
+        self.store(pc, offset_of!(JitState, pc));
+        let stop = self.load(types::I32, offset_of!(JitState, yield_on_loop));
         self.b.ins().brif(stop, exit, &[], to, &[]);
     }
     fn expr(&mut self, expr: &Expr) -> ir::Value {
         match expr {
             Expr::Constant(bits) => self.b.ins().iconst(types::I64, *bits as i64),
-            Expr::Variable(slot) => {
-                let slot = self.i32(*slot);
-                self.call("get", &[slot]).unwrap()
-            }
+            Expr::Variable(slot) => self.b.ins().load(
+                types::I64,
+                ir::MemFlags::trusted(),
+                self.vars,
+                (*slot * 8) as i32,
+            ),
             Expr::Argument(slot) => {
-                let slot = self.i32(*slot);
-                self.call("arg", &[slot]).unwrap()
+                let args = self.load(self.pointer, offset_of!(JitState, args));
+                self.b.ins().load(
+                    types::I64,
+                    ir::MemFlags::trusted(),
+                    args,
+                    (*slot * 8) as i32,
+                )
             }
             Expr::State(field) => {
                 let field = self.i32(*field as usize);
@@ -389,19 +600,74 @@ impl Emitter<'_> {
             }
             Expr::List(op, slot, arg) => {
                 let arg = self.expr(arg);
-                let op = self.i32(*op as usize);
-                let slot = self.i32(*slot);
                 let zero = self.b.ins().iconst(types::I64, 0);
-                self.call("list", &[op, slot, arg, zero]).unwrap()
+                self.list(*op, *slot, arg, zero)
             }
             Expr::Unary(op, a) => {
                 let a = self.expr(a);
+                if *op == 0 {
+                    let a = self.truthy(a);
+                    let result = self.b.ins().icmp_imm(ir::condcodes::IntCC::Equal, a, 0);
+                    return self.boolean(result);
+                }
+                if (2..=6).contains(op) {
+                    let n = self.num(a);
+                    let result = match op {
+                        2 => {
+                            let half = self.b.ins().f64const(0.5);
+                            let n = self.b.ins().fadd(n, half);
+                            self.b.ins().floor(n)
+                        }
+                        3 => self.b.ins().fabs(n),
+                        4 => self.b.ins().floor(n),
+                        5 => self.b.ins().ceil(n),
+                        _ => self.b.ins().sqrt(n),
+                    };
+                    return self.bits(result);
+                }
                 let op = self.i32(*op as usize);
                 self.call("unary", &[op, a]).unwrap()
             }
             Expr::Binary(op, a, b) => {
                 let a = self.expr(a);
                 let b = self.expr(b);
+                if *op == 8 || *op == 9 {
+                    let a = self.truthy(a);
+                    let b = self.truthy(b);
+                    let result = if *op == 8 {
+                        self.b.ins().band(a, b)
+                    } else {
+                        self.b.ins().bor(a, b)
+                    };
+                    return self.boolean(result);
+                }
+                if (5..=7).contains(op) {
+                    let a_boxed = self.boxed(a);
+                    let b_boxed = self.boxed(b);
+                    let boxed = self.b.ins().bor(a_boxed, b_boxed);
+                    let slow = self.b.create_block();
+                    let fast = self.b.create_block();
+                    let join = self.b.create_block();
+                    self.b.append_block_param(join, types::I64);
+                    self.b.ins().brif(boxed, slow, &[], fast, &[]);
+                    self.b.switch_to_block(fast);
+                    let na = self.raw_num(a);
+                    let nb = self.raw_num(b);
+                    let condition = match op {
+                        5 => ir::condcodes::FloatCC::LessThan,
+                        6 => ir::condcodes::FloatCC::Equal,
+                        _ => ir::condcodes::FloatCC::GreaterThan,
+                    };
+                    let result = self.b.ins().fcmp(condition, na, nb);
+                    let result = self.boolean(result);
+                    self.b.ins().jump(join, &[result.into()]);
+                    self.b.switch_to_block(slow);
+                    let op = self.i32(*op as usize);
+                    let result = self.call("binary", &[op, a, b]).unwrap();
+                    self.b.ins().jump(join, &[result.into()]);
+                    self.b.switch_to_block(join);
+                    return self.b.block_params(join)[0];
+                }
                 if *op < 4 {
                     let a = self.num(a);
                     let b = self.num(b);
