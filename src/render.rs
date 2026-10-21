@@ -1,4 +1,7 @@
-use crate::{project::Project, runtime::SpriteState};
+use crate::{
+    project::Project,
+    runtime::{SharedScene, SpriteState},
+};
 use anyhow::{Context, Result, ensure};
 use wgpu::util::DeviceExt;
 const WIDTH: u32 = 480;
@@ -27,6 +30,9 @@ pub(crate) struct Renderer {
     vertices: wgpu::Buffer,
     costumes: Vec<Vec<Costume>>,
     order: Vec<usize>,
+    pen_texture: wgpu::Texture,
+    pen_bind: wgpu::BindGroup,
+    pen_generation: u64,
 }
 impl Renderer {
     pub async fn new(project: &Project) -> Result<Self> {
@@ -132,6 +138,40 @@ impl Renderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let pen_texture = device.create_texture_with_data(
+            &queue,
+            &wgpu::TextureDescriptor {
+                label: Some("Persistent pen layer"),
+                size: wgpu::Extent3d {
+                    width: WIDTH,
+                    height: HEIGHT,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &vec![0; (WIDTH * HEIGHT * 4) as usize],
+        );
+        let pen_view = pen_texture.create_view(&Default::default());
+        let pen_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Pen layer"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&pen_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
         let mut costumes = vec![];
         let mut pixel_budget = 0u64;
         for target in &project.targets {
@@ -221,7 +261,7 @@ impl Renderer {
         });
         let vertices = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: (project.targets.len().max(1) * 6 * std::mem::size_of::<Vertex>()) as u64,
+            size: ((project.targets.len() + 1) * 6 * std::mem::size_of::<Vertex>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -241,6 +281,9 @@ impl Renderer {
             vertices,
             costumes,
             order,
+            pen_texture,
+            pen_bind,
+            pen_generation: u64::MAX,
         })
     }
     /// Pick the frontmost visible, nontransparent costume pixel. Transform the
@@ -289,8 +332,49 @@ impl Renderer {
         }
         None
     }
-    pub fn capture(&mut self, states: &[SpriteState]) -> Result<Vec<u8>> {
-        let mut vertices = Vec::with_capacity(states.len() * 6);
+    pub fn capture_scene(
+        &mut self,
+        scene: &SharedScene,
+        states: &[SpriteState],
+    ) -> Result<Vec<u8>> {
+        let update = {
+            let layer = scene.pen.lock().unwrap_or_else(|e| e.into_inner());
+            (layer.generation != self.pen_generation)
+                .then(|| (layer.generation, layer.pixels.clone()))
+        };
+        if let Some((generation, mut pixels)) = update {
+            pixels.resize((WIDTH * HEIGHT * 4) as usize, 0);
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.pen_texture,
+                    mip_level: 0,
+                    origin: Default::default(),
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &pixels,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(WIDTH * 4),
+                    rows_per_image: Some(HEIGHT),
+                },
+                wgpu::Extent3d {
+                    width: WIDTH,
+                    height: HEIGHT,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.pen_generation = generation;
+        }
+        self.capture(states)
+    }
+    fn capture(&mut self, states: &[SpriteState]) -> Result<Vec<u8>> {
+        let mut vertices = Vec::with_capacity((states.len() + 1) * 6);
+        for [u, v] in [[0., 0.], [1., 0.], [0., 1.], [0., 1.], [1., 0.], [1., 1.]] {
+            vertices.push(Vertex {
+                position: [u * 2.0 - 1.0, 1.0 - v * 2.0],
+                uv: [u, v],
+            });
+        }
         let mut draws = vec![];
         for &id in &self.order {
             let state = &states[id];
@@ -352,9 +436,19 @@ impl Renderer {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_vertex_buffer(0, self.vertices.slice(..));
+            let mut pen_drawn = false;
             for (id, costume, start) in draws {
+                if !states[id].is_stage && !pen_drawn {
+                    pass.set_bind_group(0, &self.pen_bind, &[]);
+                    pass.draw(0..6, 0..1);
+                    pen_drawn = true;
+                }
                 pass.set_bind_group(0, &self.costumes[id][costume].bind, &[]);
                 pass.draw(start..start + 6, 0..1);
+            }
+            if !pen_drawn {
+                pass.set_bind_group(0, &self.pen_bind, &[]);
+                pass.draw(0..6, 0..1);
             }
         }
         encoder.copy_texture_to_buffer(
@@ -437,6 +531,140 @@ fn decode(name: &str, data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires MSBJIT_HARDWARE_PROJECT and a wgpu adapter"]
+    fn sbtext_hardware_emulator_boots_draws_and_accepts_keyboard() -> Result<()> {
+        use crate::{
+            input::InputEvent,
+            runtime::{self, RuntimeOptions},
+        };
+        use std::{
+            sync::{Arc, atomic::Ordering},
+            thread,
+            time::{Duration, Instant},
+        };
+        let Ok(path) = std::env::var("MSBJIT_HARDWARE_PROJECT") else {
+            eprintln!(
+                "Skipping optional emulator fixture: set MSBJIT_HARDWARE_PROJECT to hardware_emu.sb3"
+            );
+            return Ok(());
+        };
+        let project = Arc::new(Project::load(path)?);
+        let running = runtime::spawn_interactive(
+            project.clone(),
+            RuntimeOptions {
+                time_limit: Some(Duration::from_secs(20)),
+                ..Default::default()
+            },
+        )?;
+        running.scene.input.send(InputEvent::Flag);
+        let deadline = Instant::now() + Duration::from_secs(40);
+        while running.scene.steps.load(Ordering::Relaxed) < 650_000 {
+            if running.is_finished() {
+                running.join()?;
+                anyhow::bail!("emulator stopped before boot completed");
+            }
+            ensure!(Instant::now() < deadline, "emulator boot timed out");
+            thread::sleep(Duration::from_millis(10));
+        }
+        running.scene.input.send(InputEvent::Key {
+            key: "up arrow".into(),
+            down: true,
+        });
+        thread::sleep(Duration::from_millis(150));
+        running.scene.input.send(InputEvent::Release);
+        let scene = running.scene.clone();
+        running.stop();
+        let report = running.join()?;
+        let variable = |name: &str| {
+            &report
+                .variables
+                .iter()
+                .find(|v| v.name == name)
+                .unwrap()
+                .value
+        };
+        assert_eq!(
+            variable("CPU_RUNNING"),
+            &crate::value::ScratchValue::Number(1.0)
+        );
+        assert_eq!(
+            variable("STEP_MODE"),
+            &crate::value::ScratchValue::Number(1.0)
+        );
+        for name in ["RAM_BYTES", "HDD_BYTES"] {
+            assert_eq!(
+                report
+                    .lists
+                    .iter()
+                    .find(|l| l.name == name)
+                    .unwrap()
+                    .items
+                    .len(),
+                65_536
+            );
+        }
+        let text = &report
+            .lists
+            .iter()
+            .find(|l| l.name == "IO_TEXT_BUFFER")
+            .unwrap()
+            .items;
+        assert!(!text.is_empty(), "CPU did not produce terminal output");
+        let layer = scene.pen.lock().unwrap();
+        assert!(
+            layer.pixels.chunks_exact(4).any(|p| p[3] > 0),
+            "terminal did not draw any pen pixels"
+        );
+        drop(layer);
+        let mut renderer = pollster::block_on(Renderer::new(&project))?;
+        let rgba = renderer.capture_scene(&scene, &report.sprites)?;
+        assert!(rgba.chunks_exact(4).any(|p| p[..3] != [255, 255, 255]));
+        if let Ok(path) = std::env::var("MSBJIT_HARDWARE_CAPTURE") {
+            image::save_buffer(path, &rgba, WIDTH, HEIGHT, image::ColorType::Rgba8)?;
+        }
+        eprintln!(
+            "Emulator: {} native steps; terminal bytes {:?}; keyboard STEP_MODE=1",
+            report.steps, text
+        );
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires a wgpu graphics adapter"]
+    fn native_pen_blocks_render_between_backdrop_and_sprites() -> Result<()> {
+        let mut project = Project::load(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/demo.sb3"))?;
+        for target in &mut project.targets {
+            target.blocks.clear();
+        }
+        let sprite = project.targets.iter_mut().find(|t| !t.is_stage).unwrap();
+        sprite.blocks = serde_json::from_value(serde_json::json!({
+            "flag":{"opcode":"event_whenflagclicked","topLevel":true,"next":"home"},
+            "home":{"opcode":"motion_gotoxy","inputs":{"X":[1,[4,"0"]],"Y":[1,[4,"0"]]},"next":"color"},
+            "color":{"opcode":"pen_setPenColorToColor","inputs":{"COLOR":[1,[9,"#ff0000"]]},"next":"size"},
+            "size":{"opcode":"pen_setPenSizeTo","inputs":{"SIZE":[1,[4,"12"]]},"next":"down"},
+            "down":{"opcode":"pen_penDown","next":"line"},
+            "line":{"opcode":"motion_gotoxy","inputs":{"X":[1,[4,"100"]],"Y":[1,[4,"0"]]},"next":"up"},
+            "up":{"opcode":"pen_penUp"}
+        }))?;
+        let project = std::sync::Arc::new(project);
+        let running = crate::runtime::spawn(project.clone(), Default::default())?;
+        let scene = running.scene.clone();
+        let report = running.join()?;
+        let mut renderer = pollster::block_on(Renderer::new(&project))?;
+        let baseline = renderer.capture(&report.sprites)?;
+        let rgba = renderer.capture_scene(&scene, &report.sprites)?;
+        let pixel = |x: usize, y: usize| &rgba[(y * 480 + x) * 4..][..4];
+        assert_eq!(pixel(290, 180), &[255, 0, 0, 255]);
+        assert_eq!(pixel(340, 180), &[99, 102, 241, 255]);
+        assert_eq!(pixel(450, 100), &[232, 238, 248, 255]);
+        scene.pen.lock().unwrap().clear();
+        let rgba = renderer.capture_scene(&scene, &report.sprites)?;
+        assert_eq!(
+            &rgba[(180 * 480 + 290) * 4..][..4],
+            &baseline[(180 * 480 + 290) * 4..][..4]
+        );
+        Ok(())
+    }
     #[test]
     #[ignore = "requires a wgpu graphics adapter"]
     fn gpu_capture_contains_backdrop_and_costume() -> Result<()> {

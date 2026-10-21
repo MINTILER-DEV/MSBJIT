@@ -117,7 +117,7 @@ pub async fn serve(
             }
         }
         let result = renderer
-            .capture(&states)
+            .capture_scene(&scene, &states)
             .and_then(|frame| encoder.submit(frame));
         if let Err(error) = result {
             break Err(error);

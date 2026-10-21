@@ -44,7 +44,7 @@ pub fn show(
         && duration.is_none_or(|d| start.elapsed() < d)
     {
         let states = scene.snapshot(project);
-        let rgba = renderer.capture(&states)?;
+        let rgba = renderer.capture_scene(&scene, &states)?;
         for (pixel, rgba) in buffer[WIDTH * TOOLBAR..]
             .iter_mut()
             .zip(rgba.chunks_exact(4))

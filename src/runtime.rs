@@ -2,6 +2,7 @@ use crate::{
     input::{InputController, InputEvent, InputState},
     ir::{Hat, Program},
     jit::NativeProgram,
+    pen::{PenCanvas, PenState},
     project::Project,
     value::{ScratchValue, number},
 };
@@ -10,7 +11,7 @@ use serde::Serialize;
 use std::{
     collections::{HashSet, VecDeque},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
@@ -58,6 +59,7 @@ struct AtomicSprite {
     rotation: AtomicUsize,
 }
 pub struct SharedScene {
+    pub(crate) pen: Mutex<PenCanvas>,
     pub input: InputController,
     sprites: Vec<AtomicSprite>,
     pub stopped: AtomicBool,
@@ -67,6 +69,7 @@ pub struct SharedScene {
 impl SharedScene {
     fn new(project: &Project) -> Self {
         Self {
+            pen: Mutex::new(PenCanvas::default()),
             input: InputController::default(),
             sprites: project
                 .targets
@@ -267,6 +270,7 @@ pub(crate) struct Vm {
     program: Program,
     vars: Vec<u64>,
     lists: Vec<Vec<u64>>,
+    pens: Vec<PenState>,
     current: Fiber,
     sprites: Vec<SpriteState>,
     shared: Arc<SharedScene>,
@@ -297,6 +301,7 @@ impl Vm {
             interactive: false,
             vars: program.initial_variables.clone(),
             lists: program.initial_lists.clone(),
+            pens: vec![PenState::default(); project.targets.len()],
             current: Fiber::new(0, 0, 0, program.loop_slots),
             sprites: shared.snapshot(&project),
             project,
@@ -918,6 +923,7 @@ pub(crate) extern "C" fn rt_action(vm: &mut Vm, op: u32, a: u64, b: u64) {
     let m = vm.value(b).to_number();
     let target = vm.current.target;
     let s = &mut vm.sprites[target];
+    let old_position = (s.x, s.y);
     match op {
         0 => {
             let d = s.direction.to_radians();
@@ -960,7 +966,37 @@ pub(crate) extern "C" fn rt_action(vm: &mut Vm, op: u32, a: u64, b: u64) {
         }
         16 => vm.timer = Instant::now(),
         17 => s.rotation_style = value.text(),
+        18 => vm
+            .shared
+            .pen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear(),
+        19 => {
+            let pen = &mut vm.pens[target];
+            if !pen.down {
+                pen.down = true;
+                vm.shared
+                    .pen
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .line(pen, old_position, old_position);
+            }
+        }
+        20 => vm.pens[target].down = false,
+        21 => vm.pens[target].size = n.clamp(1.0, 1200.0),
+        22 => vm.pens[target].parameter(&value.text(), m, false),
+        23 => vm.pens[target].parameter(&value.text(), m, true),
+        24 => vm.pens[target].set_color(&value),
+        25 => vm.pens[target].size = (vm.pens[target].size + n).clamp(1.0, 1200.0),
         _ => {}
+    }
+    if matches!(op, 0..=5) && vm.pens[target].down && old_position != (s.x, s.y) {
+        vm.shared
+            .pen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .line(&vm.pens[target], old_position, (s.x, s.y));
     }
     if matches!(op, 6..=8) {
         s.direction = (s.direction + 180.0).rem_euclid(360.0) - 180.0;

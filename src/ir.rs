@@ -422,6 +422,9 @@ impl Lower<'_> {
                 "sensing_keyoptions" => {
                     return Ok(self.constant(ScratchValue::String(b.field("KEY_OPTION")?.into())));
                 }
+                "pen_menu_colorParam" => {
+                    return Ok(self.constant(ScratchValue::String(b.field("colorParam")?.into())));
+                }
                 "looks_costumenumbername" => {
                     if b.field("NUMBER_NAME")? == "number" {
                         5
@@ -641,6 +644,22 @@ impl Lower<'_> {
                 let s = self.constant(ScratchValue::String(b.field("STYLE")?.into()));
                 Op::Action(17, s, self.zero())
             }
+            "pen_clear" => Op::Action(18, self.zero(), self.zero()),
+            "pen_penDown" => Op::Action(19, self.zero(), self.zero()),
+            "pen_penUp" => Op::Action(20, self.zero(), self.zero()),
+            "pen_setPenSizeTo" => Op::Action(21, self.expr_input(b, "SIZE")?, self.zero()),
+            "pen_setPenColorParamTo" => Op::Action(
+                22,
+                self.expr_input(b, "COLOR_PARAM")?,
+                self.expr_input(b, "VALUE")?,
+            ),
+            "pen_changePenColorParamBy" => Op::Action(
+                23,
+                self.expr_input(b, "COLOR_PARAM")?,
+                self.expr_input(b, "VALUE")?,
+            ),
+            "pen_setPenColorToColor" => Op::Action(24, self.expr_input(b, "COLOR")?, self.zero()),
+            "pen_changePenSizeBy" => Op::Action(25, self.expr_input(b, "SIZE")?, self.zero()),
             s => bail!("unsupported command {s}"),
         };
         self.add(op, next)
