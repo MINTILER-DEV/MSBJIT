@@ -19,6 +19,12 @@ impl NativeProgram {
     pub fn compile(program: &Program) -> Result<Self> {
         let mut jit = JITBuilder::with_flags(&[("opt_level", "speed")], default_libcall_names())?;
         let imports: Vec<(&str, *const u8, Vec<ir::Type>, Option<ir::Type>)> = vec![
+            (
+                "list",
+                rt_list as *const u8,
+                vec![types::I32, types::I32, types::I64, types::I64],
+                Some(types::I64),
+            ),
             ("pc", rt_pc as *const u8, vec![], Some(types::I32)),
             (
                 "checkpoint",
@@ -194,6 +200,14 @@ impl NativeProgram {
                         let b = e.expr(b);
                         let op = e.i32(*op as usize);
                         e.call("action", &[op, a, b]);
+                        e.b.ins().jump(next, &[]);
+                    }
+                    Op::List(op, slot, a, b) => {
+                        let a = e.expr(a);
+                        let b = e.expr(b);
+                        let op = e.i32(*op as usize);
+                        let slot = e.i32(*slot);
+                        e.call("list", &[op, slot, a, b]);
                         e.b.ins().jump(next, &[]);
                     }
                     Op::Branch(c, yes, no) => {
@@ -372,6 +386,13 @@ impl Emitter<'_> {
             Expr::State(field) => {
                 let field = self.i32(*field as usize);
                 self.call("state", &[field]).unwrap()
+            }
+            Expr::List(op, slot, arg) => {
+                let arg = self.expr(arg);
+                let op = self.i32(*op as usize);
+                let slot = self.i32(*slot);
+                let zero = self.b.ins().iconst(types::I64, 0);
+                self.call("list", &[op, slot, arg, zero]).unwrap()
             }
             Expr::Unary(op, a) => {
                 let a = self.expr(a);

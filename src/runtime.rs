@@ -126,6 +126,13 @@ pub struct VariableState {
     pub value: ScratchValue,
 }
 #[derive(Debug, Serialize)]
+pub struct ListState {
+    pub target: String,
+    pub id: String,
+    pub name: String,
+    pub items: Vec<ScratchValue>,
+}
+#[derive(Debug, Serialize)]
 pub struct RunReport {
     pub steps: u64,
     pub yields: u64,
@@ -133,6 +140,7 @@ pub struct RunReport {
     pub elapsed_seconds: f64,
     pub interrupted: bool,
     pub variables: Vec<VariableState>,
+    pub lists: Vec<ListState>,
     pub sprites: Vec<SpriteState>,
     pub messages: Vec<String>,
 }
@@ -258,6 +266,7 @@ pub(crate) struct Vm {
     project: Arc<Project>,
     program: Program,
     vars: Vec<u64>,
+    lists: Vec<Vec<u64>>,
     current: Fiber,
     sprites: Vec<SpriteState>,
     shared: Arc<SharedScene>,
@@ -287,6 +296,7 @@ impl Vm {
             input: InputState::default(),
             interactive: false,
             vars: program.initial_variables.clone(),
+            lists: program.initial_lists.clone(),
             current: Fiber::new(0, 0, 0, program.loop_slots),
             sprites: shared.snapshot(&project),
             project,
@@ -484,6 +494,7 @@ impl Vm {
                     .iter()
                     .copied()
                     .chain(self.vars.iter().copied())
+                    .chain(self.lists.iter().flatten().copied())
                     .chain(fibers.iter().flat_map(|f| {
                         f.frames.iter().flat_map(|frame| frame.args.iter().copied())
                     }));
@@ -527,6 +538,21 @@ impl Vm {
                     id: id.clone(),
                     name: name.clone(),
                     value: self.program.values.decode(self.vars[i]),
+                })
+                .collect(),
+            lists: self
+                .program
+                .list_names
+                .iter()
+                .enumerate()
+                .map(|(i, (target, id, name))| ListState {
+                    target: self.project.targets[*target].name.clone(),
+                    id: id.clone(),
+                    name: name.clone(),
+                    items: self.lists[i]
+                        .iter()
+                        .map(|v| self.program.values.decode(*v))
+                        .collect(),
                 })
                 .collect(),
             sprites: self.sprites.clone(),
@@ -605,6 +631,99 @@ pub(crate) extern "C" fn rt_get(vm: &mut Vm, slot: u32) -> u64 {
 }
 pub(crate) extern "C" fn rt_set(vm: &mut Vm, slot: u32, value: u64) {
     vm.vars[slot as usize] = value;
+}
+fn list_index(value: &ScratchValue, length: usize, random: &mut u64) -> Option<usize> {
+    let index = match value {
+        ScratchValue::String(s) if s == "last" => length as f64,
+        ScratchValue::String(s) if s == "random" || s == "any" => {
+            if length == 0 {
+                return None;
+            }
+            *random ^= *random << 13;
+            *random ^= *random >> 7;
+            *random ^= *random << 17;
+            return Some((*random % length as u64) as usize);
+        }
+        _ => value.to_number().floor(),
+    };
+    (index >= 1.0 && index <= length as f64).then(|| index as usize - 1)
+}
+pub(crate) extern "C" fn rt_list(vm: &mut Vm, op: u32, slot: u32, a: u64, b: u64) -> u64 {
+    const LIMIT: usize = 200_000;
+    let slot = slot as usize;
+    let arg = vm.value(a);
+    let length = vm.lists[slot].len();
+    let result = match op {
+        0 => {
+            if length < LIMIT {
+                vm.lists[slot].push(a);
+            }
+            ScratchValue::Number(0.0)
+        }
+        1 => {
+            if matches!(&arg, ScratchValue::String(s) if s == "all") {
+                vm.lists[slot].clear();
+            } else if let Some(index) = list_index(&arg, length, &mut vm.random) {
+                vm.lists[slot].remove(index);
+            }
+            ScratchValue::Number(0.0)
+        }
+        2 => {
+            vm.lists[slot].clear();
+            ScratchValue::Number(0.0)
+        }
+        3 => {
+            if let Some(index) = list_index(&arg, length + 1, &mut vm.random).filter(|i| *i < LIMIT)
+            {
+                vm.lists[slot].insert(index, b);
+                if vm.lists[slot].len() > LIMIT {
+                    vm.lists[slot].pop();
+                }
+            }
+            ScratchValue::Number(0.0)
+        }
+        4 => {
+            if let Some(index) = list_index(&arg, length, &mut vm.random) {
+                vm.lists[slot][index] = b;
+            }
+            ScratchValue::Number(0.0)
+        }
+        5 => {
+            return list_index(&arg, length, &mut vm.random)
+                .map(|i| vm.lists[slot][i])
+                .unwrap_or_else(|| {
+                    vm.program
+                        .values
+                        .encode(ScratchValue::String(String::new()))
+                });
+        }
+        6 => ScratchValue::Number(length as f64),
+        7 => {
+            let values: Vec<_> = vm.lists[slot].iter().map(|v| vm.value(*v)).collect();
+            let single = values
+                .iter()
+                .all(|v| matches!(v, ScratchValue::String(s) if s.encode_utf16().count() == 1));
+            ScratchValue::String(
+                values
+                    .iter()
+                    .map(ScratchValue::text)
+                    .collect::<Vec<_>>()
+                    .join(if single { "" } else { " " }),
+            )
+        }
+        8 | 9 => {
+            let index = vm.lists[slot]
+                .iter()
+                .position(|v| vm.value(*v).compare(&arg).is_eq());
+            if op == 9 {
+                ScratchValue::Boolean(index.is_some())
+            } else {
+                ScratchValue::Number(index.map_or(0.0, |i| (i + 1) as f64))
+            }
+        }
+        _ => ScratchValue::Number(0.0),
+    };
+    vm.program.values.encode(result)
 }
 pub(crate) extern "C" fn rt_arg(vm: &mut Vm, slot: u32) -> u64 {
     vm.current.frames.last().unwrap().args[slot as usize]

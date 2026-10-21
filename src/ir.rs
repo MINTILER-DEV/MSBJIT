@@ -16,12 +16,14 @@ pub(crate) enum Expr {
     Binary(u32, Box<Expr>, Box<Expr>),
     Unary(u32, Box<Expr>),
     State(u32),
+    List(u32, usize, Box<Expr>),
 }
 #[derive(Debug, Clone)]
 pub(crate) enum Op {
     Set(usize, Expr),
     Change(usize, Expr),
     Action(u32, Expr, Expr),
+    List(u32, usize, Expr, Expr),
     Branch(Expr, usize, usize),
     Jump(usize, bool),
     RepeatInit(usize, Expr, usize),
@@ -66,6 +68,8 @@ pub(crate) struct Program {
     pub procedures: Vec<Procedure>,
     pub variable_names: Vec<(usize, String, String)>,
     pub initial_variables: Vec<u64>,
+    pub list_names: Vec<(usize, String, String)>,
+    pub initial_lists: Vec<Vec<u64>>,
     pub constants: Vec<u64>,
     pub values: Values,
     pub loop_slots: usize,
@@ -74,6 +78,7 @@ struct Lower<'a> {
     project: &'a Project,
     program: Program,
     vars: BTreeMap<(usize, String), usize>,
+    lists: BTreeMap<(usize, String), usize>,
     procs: BTreeMap<(usize, String), usize>,
     target: usize,
     args: Vec<String>,
@@ -94,11 +99,14 @@ impl Program {
                 procedures: vec![],
                 variable_names: vec![],
                 initial_variables: vec![],
+                list_names: vec![],
+                initial_lists: vec![],
                 constants: vec![],
                 values: Values::default(),
                 loop_slots: 0,
             },
             vars: BTreeMap::new(),
+            lists: BTreeMap::new(),
             procs: BTreeMap::new(),
             target: 0,
             args: vec![],
@@ -106,6 +114,19 @@ impl Program {
             depth: 0,
         };
         for (target, t) in project.targets.iter().enumerate() {
+            for (id, (name, items)) in &t.lists {
+                let slot = l.program.initial_lists.len();
+                l.lists.insert((target, id.clone()), slot);
+                l.program
+                    .list_names
+                    .push((target, id.clone(), name.clone()));
+                l.program.initial_lists.push(
+                    items
+                        .iter()
+                        .map(|v| l.program.values.encode(v.clone()))
+                        .collect(),
+                );
+            }
             for (id, (name, value)) in &t.variables {
                 let slot = l.program.initial_variables.len();
                 l.vars.insert((target, id.clone()), slot);
@@ -249,6 +270,25 @@ impl Lower<'_> {
             .context("missing variable ID")?;
         self.variable(id)
     }
+    fn list_field(&self, b: &Block) -> Result<usize> {
+        let id = b
+            .fields
+            .get("LIST")
+            .and_then(|f| f.get(1))
+            .and_then(Value::as_str)
+            .context("missing list ID")?;
+        self.list(id)
+    }
+    fn list(&self, id: &str) -> Result<usize> {
+        self.lists
+            .get(&(self.target, id.to_owned()))
+            .or_else(|| {
+                let stage = self.project.targets.iter().position(|t| t.is_stage)?;
+                self.lists.get(&(stage, id.to_owned()))
+            })
+            .copied()
+            .with_context(|| format!("unknown list {id}"))
+    }
     fn input<'a>(&self, b: &'a Block, name: &str) -> Result<&'a Value> {
         let input = b
             .inputs
@@ -286,6 +326,23 @@ impl Lower<'_> {
             let opcode = b.opcode.clone();
             if opcode == "data_variable" {
                 return Ok(Expr::Variable(self.var_field(b)?));
+            }
+            let list_op = match opcode.as_str() {
+                "data_itemoflist" => Some((5, Some("INDEX"))),
+                "data_lengthoflist" => Some((6, None)),
+                "data_listcontents" => Some((7, None)),
+                "data_itemnumoflist" => Some((8, Some("ITEM"))),
+                "data_listcontainsitem" => Some((9, Some("ITEM"))),
+                _ => None,
+            };
+            if let Some((op, input)) = list_op {
+                let slot = self.list_field(b)?;
+                let arg = if let Some(input) = input {
+                    self.expr(&self.input(b, input)?.clone(), depth + 1)?
+                } else {
+                    self.zero()
+                };
+                return Ok(Expr::List(op, slot, Box::new(arg)));
             }
             if opcode.starts_with("argument_reporter_") {
                 let name = b.field("VALUE")?;
@@ -396,6 +453,13 @@ impl Lower<'_> {
                 .context("missing variable literal ID")?;
             return Ok(Expr::Variable(self.variable(id)?));
         }
+        if kind == 13 {
+            let id = array
+                .get(2)
+                .and_then(Value::as_str)
+                .context("missing list literal ID")?;
+            return Ok(Expr::List(7, self.list(id)?, Box::new(self.zero())));
+        }
         ensure!((4..=11).contains(&kind), "unsupported literal type {kind}");
         let raw = array.get(1).context("missing literal value")?;
         let value = if kind <= 8 {
@@ -438,6 +502,31 @@ impl Lower<'_> {
         let op = match b.opcode.as_str() {
             "data_setvariableto" => Op::Set(self.var_field(b)?, self.expr_input(b, "VALUE")?),
             "data_changevariableby" => Op::Change(self.var_field(b)?, self.expr_input(b, "VALUE")?),
+            "data_addtolist" => Op::List(
+                0,
+                self.list_field(b)?,
+                self.expr_input(b, "ITEM")?,
+                self.zero(),
+            ),
+            "data_deleteoflist" => Op::List(
+                1,
+                self.list_field(b)?,
+                self.expr_input(b, "INDEX")?,
+                self.zero(),
+            ),
+            "data_deletealloflist" => Op::List(2, self.list_field(b)?, self.zero(), self.zero()),
+            "data_insertatlist" => Op::List(
+                3,
+                self.list_field(b)?,
+                self.expr_input(b, "INDEX")?,
+                self.expr_input(b, "ITEM")?,
+            ),
+            "data_replaceitemoflist" => Op::List(
+                4,
+                self.list_field(b)?,
+                self.expr_input(b, "INDEX")?,
+                self.expr_input(b, "ITEM")?,
+            ),
             "control_repeat" => {
                 let slot = self.program.loop_slots;
                 self.program.loop_slots += 1;
@@ -470,6 +559,14 @@ impl Lower<'_> {
                 };
                 self.program.nodes[check].op =
                     Op::Branch(self.expr_input(b, "CONDITION")?, next, body);
+                Op::Jump(check, false)
+            }
+            "control_while" => {
+                let check = self.add(Op::Return, 0)?;
+                let back = self.add(Op::Jump(check, true), check)?;
+                let body = self.chain(self.block_input(b, "SUBSTACK")?.as_deref(), back)?;
+                self.program.nodes[check].op =
+                    Op::Branch(self.expr_input(b, "CONDITION")?, body, next);
                 Op::Jump(check, false)
             }
             "control_if" | "control_if_else" => {
@@ -529,6 +626,13 @@ impl Lower<'_> {
             "looks_changesizeby" => Op::Action(12, self.expr_input(b, "CHANGE")?, self.zero()),
             "looks_say" | "looks_think" => {
                 Op::Action(13, self.expr_input(b, "MESSAGE")?, self.zero())
+            }
+            "looks_sayforsecs" | "looks_thinkforsecs" => {
+                let seconds = self.expr_input(b, "SECS")?;
+                let wait = self.add(Op::Wait(seconds), next)?;
+                let message = self.expr_input(b, "MESSAGE")?;
+                let zero = self.zero();
+                return self.add(Op::Action(13, message, zero), wait);
             }
             "looks_switchcostumeto" => Op::Action(14, self.expr_input(b, "COSTUME")?, self.zero()),
             "looks_nextcostume" => Op::Action(15, self.zero(), self.zero()),

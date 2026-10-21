@@ -22,6 +22,8 @@ pub struct Target {
     #[serde(default)]
     pub variables: BTreeMap<String, (String, ScratchValue)>,
     #[serde(default)]
+    pub lists: BTreeMap<String, (String, Vec<ScratchValue>)>,
+    #[serde(default)]
     pub blocks: BTreeMap<String, Block>,
     #[serde(default)]
     pub costumes: Vec<Costume>,

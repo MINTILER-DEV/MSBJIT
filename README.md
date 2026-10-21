@@ -60,7 +60,8 @@ The renderer reads atomic sprite components without locking the execution thread
 - Green flag and broadcast-received hats; broadcast and broadcast-and-wait.
 - Key-pressed hats (letters, digits, arrows, space, Enter, and any), sprite/stage clicks, key-pressed and mouse x/y/down reporters. Clicks select the frontmost visible, nontransparent costume pixel with size, rotation, mirroring, and layer order applied.
 - Variable set, change, and reporters; sprite-local and stage variables.
-- Repeat, forever, repeat-until, wait-until, if, if/else, wait, and all three stop modes.
+- List add, delete, delete all, insert, replace, item, item number, length, contains, and contents reporters; list IDs resolve locally with stage fallback. Lists preserve strings across scheduler collection and use Scratch's 200,000-item mutation limit and special indices.
+- Repeat, forever, repeat-until, while, wait-until, if, if/else, wait, and all three stop modes.
 - Custom block definitions/calls with parameters, defaults, recursion, and inherited warp mode.
 - Arithmetic, modulo, comparisons, booleans, random, join, contains, letter, length, round, and standard math reporters.
 - Move steps, go to x/y, set/change x/y, point direction, turn, and rotation style.
