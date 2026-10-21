@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MSBJIT · Scratch player</title>
+<style>
+body{font:16px system-ui;background:#111827;color:#e5e7eb;margin:0;display:grid;place-content:center;min-height:100vh;text-align:center}
+video{width:min(960px,96vw);aspect-ratio:4/3;background:white;border-radius:12px;box-shadow:0 12px 45px #0008}
+p{color:#9ca3af}button{background:#6366f1;color:white;border:0;border-radius:8px;padding:12px 24px;font:inherit;cursor:pointer}
+</style>
+<h1>MSBJIT</h1><video id="stage" autoplay muted playsinline></video>
+<p id="status">Ready to connect to the native runtime</p><div><button id="connect">Connect</button></div>
+<script>
+const status = document.querySelector('#status'), button = document.querySelector('#connect');
+let peer, socket;
+button.onclick = async () => {
+  button.disabled = true;
+  try {
+    peer?.close();
+    if (socket) {socket.onclose = null; socket.close();}
+    peer = new RTCPeerConnection({iceServers: []});
+    peer.addTransceiver('video', {direction: 'recvonly'});
+    peer.ontrack = e => { document.querySelector('#stage').srcObject = e.streams[0] || new MediaStream([e.track]); };
+    peer.onconnectionstatechange = () => { status.textContent = `Connection: ${peer.connectionState}`; };
+    socket = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
+    await new Promise((resolve, reject) => { socket.onopen = resolve; socket.onerror = reject; });
+    socket.onmessage = async e => {
+      try { const answer = JSON.parse(e.data); if (answer.type === 'answer') await peer.setRemoteDescription(answer); }
+      catch (error) { status.textContent = error.message; }
+    };
+    socket.onclose = () => { status.textContent = 'Signaling disconnected'; peer.close(); button.disabled = false; };
+    await peer.setLocalDescription(await peer.createOffer());
+    if (peer.iceGatheringState !== 'complete') await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Local ICE gathering timed out')), 10000);
+      peer.addEventListener('icegatheringstatechange', () => { if (peer.iceGatheringState === 'complete') { clearTimeout(timer); resolve(); } });
+    });
+    socket.send(JSON.stringify(peer.localDescription));
+    status.textContent = 'Connecting over local UDP…';
+  } catch (error) { status.textContent = error.message || 'Connection failed'; peer?.close(); socket?.close(); }
+  finally { button.disabled = false; }
+};
+window.onbeforeunload = () => { peer?.close(); socket?.close(); };
+</script></html>

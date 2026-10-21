@@ -1,0 +1,55 @@
+{
+  "targets": [
+    {
+      "name": "Stage",
+      "isStage": true,
+      "variables": {
+        "counter": [
+          "counter",
+          0
+        ]
+      },
+      "blocks": {
+        "flag": {
+          "opcode": "event_whenflagclicked",
+          "topLevel": true,
+          "next": "repeat"
+        },
+        "repeat": {
+          "opcode": "control_repeat",
+          "inputs": {
+            "TIMES": [
+              1,
+              [
+                6,
+                "1000000"
+              ]
+            ],
+            "SUBSTACK": [
+              2,
+              "inc"
+            ]
+          }
+        },
+        "inc": {
+          "opcode": "data_changevariableby",
+          "fields": {
+            "VARIABLE": [
+              "counter",
+              "counter"
+            ]
+          },
+          "inputs": {
+            "VALUE": [
+              1,
+              [
+                4,
+                "1"
+              ]
+            ]
+          }
+        }
+      }
+    }
+  ]
+}
