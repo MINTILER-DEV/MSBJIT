@@ -1,17 +1,43 @@
 # MSBJIT
 
-A Rust runtime that loads Scratch 3 `.sb3` projects, lowers scripts to a validated control-flow graph, and compiles that graph to native code with Cranelift. Execution runs on a dedicated thread. Optional wgpu rendering and local WebRTC streaming run independently of the script tick rate.
+A Rust runtime for Windows and Linux that loads Scratch 3 `.sb3` projects, lowers scripts to a validated control-flow graph, and compiles that graph to native code with Cranelift. Execution runs on a dedicated thread. An interactive native stage window and optional local WebRTC streaming run independently of the script tick rate.
 
-Requires Rust 1.93 or newer. The streaming feature also requires a graphics adapter supported by wgpu and an `ffmpeg` executable with an H.264 encoder.
+Requires Rust 1.93 or newer. The default build includes a native stage window using wgpu and minifb. It needs a graphics adapter supported by wgpu; **the local window does not need FFmpeg**. The optional streaming feature also needs an `ffmpeg` executable with an H.264 encoder on PATH.
+
+## Windows quick start
+
+Install Rust with the MSVC toolchain and Visual Studio Build Tools with the **Desktop development with C++** workload. Run these commands in PowerShell from the repository:
+
+```powershell
+cargo build --release --locked
+.\target\release\msbjit.exe .\examples\interactive.sb3
+# Or open your own project (paths with spaces must be quoted):
+.\target\release\msbjit.exe "C:\Projects\My game.sb3"
+```
+
+The native stage opens automatically for `.sb3` files and starts the green-flag scripts once the renderer is ready. Click its green flag to start them again, or the red square to stop scripts while keeping the window open. Closing the window exits the host. The stage keeps its 4:3 shape when resized, and mouse input accounts for scaling and letterboxing. Keyboard input goes to the focused window; losing focus releases held keys and mouse buttons.
+
+In `interactive.sb3`, arrow keys move the sprite, clicking its visible pixels changes its costume, and space moves it to the mouse. The green flag returns it to the center. Rebuild this example with `python examples/make_interactive.py`.
+
+## Running projects
 
 ```sh
 cargo run --release -- examples/counter.json --turbo --json
 cargo run --release -- examples/demo.sb3 --seconds 5
+cargo run --release -- examples/demo.sb3 --headless --seconds 5 --json
 cargo run --release --features streaming -- examples/demo.sb3 \
   --serve 127.0.0.1:8080 --fps 144 --encoder auto
 ```
 
-Open `http://127.0.0.1:8080` and click **Connect**. Press Ctrl-C to stop the host. To view from another machine on a trusted LAN, bind to `0.0.0.0:8080` and open the host's LAN address. The player uses host ICE candidates with an empty ICE server list; there are no STUN/TURN or third-party signaling services. This server has no authentication and is intended for loopback or a trusted private network.
+For streaming, open `http://127.0.0.1:8080`, click **Connect**, then **Green flag**. Click the stage to focus it for keyboard and pointer input. **Stop** cancels current scripts; **Green flag** starts them again. Browser clients share control of one project; disconnecting releases held inputs. Press Ctrl-C to stop the host. To view from another machine on a trusted LAN, bind to `0.0.0.0:8080` and open the host's LAN address. The player uses host ICE candidates with an empty ICE server list; there are no STUN/TURN or third-party signaling services. This server has no authentication and is intended for loopback or a trusted private network.
+
+Windows streaming command (requires FFmpeg):
+
+```powershell
+cargo run --release --features streaming -- .\examples\interactive.sb3 --serve 127.0.0.1:8080 --encoder auto
+```
+
+Use `--display` to request a window explicitly, including for asset-free JSON projects. Use `--headless` for batch runs, or `cargo run --no-default-features -- <project>` to build without window/graphics dependencies. `--serve` selects the browser player instead of the local window. On Linux, the default minifb build needs X11/Wayland development libraries (`libx11-dev libxkbcommon-dev libwayland-dev` on Debian/Ubuntu).
 
 `--seconds` sets an execution limit and, when streaming, a host duration. `--max-steps` caps executed IR instructions. `--tick-hz` defaults to 30. `--turbo` removes loop frame boundaries without removing explicit waits. `--watchdog-ms` may lower the warp execution budget from its maximum of 500 ms. `--json` prints final variables, sprite state, captured say/think messages, and execution statistics. Compilation time is excluded from execution statistics.
 
@@ -30,6 +56,7 @@ The renderer reads atomic sprite components without locking the execution thread
 ## Supported blocks
 
 - Green flag and broadcast-received hats; broadcast and broadcast-and-wait.
+- Key-pressed hats (letters, digits, arrows, space, Enter, and any), sprite/stage clicks, key-pressed and mouse x/y/down reporters. Clicks select the frontmost visible, nontransparent costume pixel with size, rotation, mirroring, and layer order applied.
 - Variable set, change, and reporters; sprite-local and stage variables.
 - Repeat, forever, repeat-until, wait-until, if, if/else, wait, and all three stop modes.
 - Custom block definitions/calls with parameters, defaults, recursion, and inherited warp mode.
@@ -38,11 +65,11 @@ The renderer reads atomic sprite components without locking the execution thread
 - Show/hide, set/change size, switch/next costume, costume reporters, say/think logging, and timer/reset timer.
 - SVG, PNG, and JPEG costumes, bitmap resolution, rotation centers, sprite rotation/visibility/size, and initial layer order. The stage is 480 × 360.
 
-This is a bounded Scratch subset. Lists, clones, keyboard/mouse/click events, sensing collisions, sound, pen/extensions, glide, effects, backdrop commands, variable monitors, and speech-bubble rendering are not implemented. Say/think text appears in the final report. SVG text/font support is disabled in this build. Raw JSON projects support execution; costume rendering requires assets from an `.sb3` archive. String operators currently use Unicode scalar characters rather than JavaScript UTF-16 code units, so non-BMP text may differ from Scratch. Size/position clamping also differs from Scratch's renderer.
+This is a bounded Scratch subset. Lists, clones, sensing collisions, sound, pen/extensions, glide, effects, backdrop commands, variable monitors, and speech-bubble rendering are not implemented. Say/think text appears in the final report. SVG text/font support is disabled in this build. Raw JSON projects support execution; costume rendering requires assets from an `.sb3` archive. String operators currently use Unicode scalar characters rather than JavaScript UTF-16 code units, so non-BMP text may differ from Scratch. Size/position clamping also differs from Scratch's renderer. Key hats fire on a new press and do not overlap an already-running instance of the same hat; OS key auto-repeat is not forwarded. Green flag cancels current scripts and resets the timer; it preserves changed variables and sprite properties, as Scratch scripts are responsible for initializing them.
 
 ## Streaming and performance limits
 
-`--encoder auto` probes NVENC, VA-API, then software libx264 with an actual one-frame encode. Explicit choices are `nvenc`, `vaapi`, and `software`; `--vaapi-device` selects the render device. Every encoder disables B-frames, uses a one-second keyframe interval, and produces H.264 Annex-B access units. webrtc-rs packetizes those units as RTP/SRTP over UDP. The bundled browser is receive-only; it does not forward project input.
+`--encoder auto` probes NVENC, then software libx264 on Windows, and NVENC, VA-API, then libx264 on Linux, using an actual one-frame encode. Explicit choices are `nvenc`, `vaapi` (Linux only), and `software`; `--vaapi-device` selects the Linux render device. Every encoder disables B-frames, uses a one-second keyframe interval, and produces H.264 Annex-B access units. webrtc-rs packetizes those units as RTP/SRTP over UDP. The bundled browser forwards input and player controls over the existing local WebSocket.
 
 **GPU capture currently uses portable texture-to-buffer readback followed by a CPU pipe to FFmpeg.** DMA-BUF/CUDA/VA-API texture interop and a zero-copy encoder path remain unimplemented. AV1 is not implemented. The spec's sub-millisecond capture, 2–5 ms hardware encoding, and 5–25 ms network budgets are performance targets, not measured guarantees. A 144 Hz capture setting does not guarantee that the available GPU, encoder, network, or browser will sustain that rate.
 
@@ -51,6 +78,7 @@ This is a bounded Scratch subset. Lists, clones, keyboard/mouse/click events, se
 ```sh
 cargo test
 cargo test --all-features
+cargo test --no-default-features
 # Optional GPU/FFmpeg/WebRTC integration checks:
 cargo test --all-features -- --ignored
 cargo clippy --all-targets --all-features -- -D warnings
@@ -58,3 +86,5 @@ cargo fmt --check
 ```
 
 Runtime tests execute generated native code for arithmetic/coercion, branches, nested loops, frame pacing, warp inheritance/watchdogs, cancellation, explicit waits, procedure arguments, broadcasts, string lifetime, and atomic scene publication. Streaming unit tests cover Annex-B parsing. Opt-in integration tests validate captured pixel colors and GPU → FFmpeg → WebSocket/host ICE → H.264 RTP delivery to a native WebRTC peer. These can run through a software wgpu adapter and libx264; browser compatibility and physical GPU encoder performance require separate validation.
+
+Input tests also execute native key/click hats and sensing reporters, idle event dispatch, focus-loss release, stop/green-flag behavior, and window pointer-coordinate mapping. CI runs compilation, tests, formatting, and Clippy on Windows and Linux; GUI/GPU/FFmpeg integration checks remain opt-in.
