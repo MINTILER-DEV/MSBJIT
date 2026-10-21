@@ -171,10 +171,18 @@ impl Encoder {
             "encoder must be auto, nvenc, vaapi, or software"
         );
         let candidates: Vec<&str> = if requested == "auto" {
-            vec!["nvenc", "vaapi", "software"]
+            if cfg!(target_os = "linux") {
+                vec!["nvenc", "vaapi", "software"]
+            } else {
+                vec!["nvenc", "software"]
+            }
         } else {
             vec![requested]
         };
+        ensure!(
+            requested != "vaapi" || cfg!(target_os = "linux"),
+            "VA-API is only supported on Linux; use auto, nvenc, or software on Windows"
+        );
         let kind=candidates.into_iter().find(|kind|probe(kind,fps,device)).context("no usable FFmpeg H.264 encoder; install FFmpeg with libx264, NVENC, or VA-API support")?;
         eprintln!("Encoder: {kind} (B-frames disabled, one-second keyframe interval)");
         let mut child = Command::new("ffmpeg")

@@ -1,4 +1,5 @@
 use crate::{
+    input::{InputController, InputEvent, InputState},
     ir::{Hat, Program},
     jit::NativeProgram,
     project::Project,
@@ -57,6 +58,7 @@ struct AtomicSprite {
     rotation: AtomicUsize,
 }
 pub struct SharedScene {
+    pub input: InputController,
     sprites: Vec<AtomicSprite>,
     pub stopped: AtomicBool,
     pub steps: AtomicU64,
@@ -65,6 +67,7 @@ pub struct SharedScene {
 impl SharedScene {
     fn new(project: &Project) -> Self {
         Self {
+            input: InputController::default(),
             sprites: project
                 .targets
                 .iter()
@@ -161,6 +164,19 @@ impl Drop for RunningProject {
     }
 }
 pub fn spawn(project: Arc<Project>, options: RuntimeOptions) -> Result<RunningProject> {
+    spawn_mode(project, options, false)
+}
+/// Keep the scheduler alive for keyboard/click hats and player controls, even
+/// after all current scripts finish. Stop the host through RunningProject::stop.
+/// Starts idle; send InputEvent::Flag when the display is ready to run scripts.
+pub fn spawn_interactive(project: Arc<Project>, options: RuntimeOptions) -> Result<RunningProject> {
+    spawn_mode(project, options, true)
+}
+fn spawn_mode(
+    project: Arc<Project>,
+    options: RuntimeOptions,
+    interactive: bool,
+) -> Result<RunningProject> {
     ensure!(
         options.tick_hz.is_finite() && (1.0..=1000.0).contains(&options.tick_hz),
         "tick rate must be between 1 and 1000 Hz"
@@ -178,6 +194,7 @@ pub fn spawn(project: Arc<Project>, options: RuntimeOptions) -> Result<RunningPr
             let result = (|| {
                 let native = NativeProgram::compile(&program)?;
                 let mut vm = Vm::new(project, program, options, shared.clone());
+                vm.interactive = interactive;
                 vm.run(&native)
             })();
             if result.is_err() {
@@ -233,8 +250,11 @@ impl Fiber {
 enum Event {
     Broadcast { name: String, wait: bool },
     StopOthers,
+    StopAll,
 }
 pub(crate) struct Vm {
+    input: InputState,
+    interactive: bool,
     project: Arc<Project>,
     program: Program,
     vars: Vec<u64>,
@@ -264,6 +284,8 @@ impl Vm {
     ) -> Self {
         let now = Instant::now();
         Self {
+            input: InputState::default(),
+            interactive: false,
             vars: program.initial_variables.clone(),
             current: Fiber::new(0, 0, 0, program.loop_slots),
             sprites: shared.snapshot(&project),
@@ -312,17 +334,57 @@ impl Vm {
             .program
             .scripts
             .iter()
-            .filter(|s| matches!(s.hat, Hat::Flag))
+            .filter(|s| !self.interactive && matches!(s.hat, Hat::Flag))
             .enumerate()
             .map(|(i, s)| Fiber::new(i as u64 + 1, s.target, s.entry, self.program.loop_slots))
             .collect();
         let mut next_id = fibers.len() as u64 + 1;
         let tick = Duration::from_secs_f64(1.0 / self.options.tick_hz);
         let mut tick_deadline = Instant::now();
-        while !fibers.is_empty() && !self.shared.stopped.load(Ordering::Relaxed) {
+        while (!fibers.is_empty() || self.interactive)
+            && !self.shared.stopped.load(Ordering::Relaxed)
+        {
             if self.limit_reached() {
                 self.shared.stopped.store(true, Ordering::Relaxed);
                 break;
+            }
+            let (input, events) = self.shared.input.drain();
+            self.input = input;
+            for event in events {
+                if matches!(event, InputEvent::Stop | InputEvent::Flag) {
+                    fibers.clear();
+                }
+                if matches!(event, InputEvent::Flag) {
+                    self.timer = Instant::now();
+                }
+                for (script_id, script) in self.program.scripts.iter().enumerate() {
+                    let triggered = match (&event, &script.hat) {
+                        (InputEvent::Flag, Hat::Flag) => true,
+                        (InputEvent::Key { key, down: true }, Hat::Key(expected)) => {
+                            expected.eq_ignore_ascii_case("any")
+                                || crate::input::normalize_key(expected).as_ref() == Some(key)
+                        }
+                        (InputEvent::Click { target }, Hat::Click) => *target == script.target,
+                        _ => false,
+                    };
+                    // Input hats do not restart an already-running instance.
+                    if triggered
+                        && fibers.len() < 4096
+                        && !fibers
+                            .iter()
+                            .any(|f| f.receiver == Some(script_id) && !f.done)
+                    {
+                        let mut fiber = Fiber::new(
+                            next_id,
+                            script.target,
+                            script.entry,
+                            self.program.loop_slots,
+                        );
+                        next_id += 1;
+                        fiber.receiver = Some(script_id);
+                        fibers.push(fiber);
+                    }
+                }
             }
             self.ticks += 1;
             let mut index = 0;
@@ -399,6 +461,12 @@ impl Vm {
                                 }
                             }
                         }
+                        Event::StopAll => {
+                            for fiber in &mut fibers {
+                                fiber.done = true;
+                            }
+                            self.current.done = true;
+                        }
                     }
                 }
                 fibers[index] = std::mem::replace(&mut self.current, Fiber::new(0, 0, 0, 0));
@@ -420,7 +488,7 @@ impl Vm {
                         f.frames.iter().flat_map(|frame| frame.args.iter().copied())
                     }));
             self.program.values.collect(roots);
-            if fibers.is_empty() {
+            if fibers.is_empty() && !self.interactive {
                 break;
             }
             if !self.options.turbo {
@@ -602,7 +670,11 @@ pub(crate) extern "C" fn rt_broadcast(vm: &mut Vm, name: u64, wait: u32, next: u
 pub(crate) extern "C" fn rt_stop(vm: &mut Vm, mode: u32) {
     match mode {
         0 => {
-            vm.shared.stopped.store(true, Ordering::Relaxed);
+            if vm.interactive {
+                vm.events.push(Event::StopAll);
+            } else {
+                vm.shared.stopped.store(true, Ordering::Relaxed);
+            }
             vm.current.done = true;
         }
         1 => vm.current.done = true,
@@ -671,6 +743,7 @@ pub(crate) extern "C" fn rt_unary(vm: &mut Vm, op: u32, a: u64) -> u64 {
     let result = match op {
         0 => ScratchValue::Boolean(!a.to_bool()),
         1 => ScratchValue::Number(a.text().chars().count() as f64),
+        17 => ScratchValue::Boolean(vm.input.key_down(&a.text())),
         _ => ScratchValue::Number(match op {
             2 => (n + 0.5).floor(),
             3 => n.abs(),
@@ -693,6 +766,12 @@ pub(crate) extern "C" fn rt_unary(vm: &mut Vm, op: u32, a: u64) -> u64 {
     vm.program.values.encode(result)
 }
 pub(crate) extern "C" fn rt_state(vm: &mut Vm, field: u32) -> u64 {
+    if field == 9 {
+        return vm
+            .program
+            .values
+            .encode(ScratchValue::Boolean(vm.input.down));
+    }
     let s = &vm.sprites[vm.current.target];
     if field == 6 {
         let name = vm.project.targets[vm.current.target]
@@ -709,6 +788,8 @@ pub(crate) extern "C" fn rt_state(vm: &mut Vm, field: u32) -> u64 {
         3 => s.size,
         4 => vm.timer.elapsed().as_secs_f64(),
         5 => s.costume as f64 + 1.0,
+        7 => vm.input.x,
+        8 => vm.input.y,
         _ => 0.0,
     })
 }

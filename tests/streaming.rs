@@ -2,10 +2,72 @@
 use anyhow::{Context, Result, ensure};
 use futures_util::{SinkExt, StreamExt};
 use msbjit::{
+    input::InputEvent,
     project::Project,
     runtime::{self, RuntimeOptions},
     streaming::{self, StreamOptions},
 };
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a wgpu adapter and FFmpeg with libx264"]
+async fn browser_input_reaches_native_scripts_over_websocket() -> Result<()> {
+    let project = Arc::new(Project::load(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/interactive.sb3"
+    ))?);
+    let running = runtime::spawn_interactive(project.clone(), RuntimeOptions::default())?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    drop(listener);
+    let server = tokio::spawn(streaming::serve(
+        project.clone(),
+        running.scene.clone(),
+        StreamOptions {
+            address,
+            fps: 30,
+            encoder: "software".into(),
+            vaapi_device: "/dev/dri/renderD128".into(),
+            duration: Some(Duration::from_secs(15)),
+        },
+    ));
+    let test = async {
+        let mut connected = None;
+        for _ in 0..200 {
+            if let Ok((ws, _)) = tokio_tungstenite::connect_async(format!("ws://{address}/ws")).await {
+                connected = Some(ws); break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let mut ws = connected.context("input server did not start")?;
+        let key = serde_json::json!({"type":"input","event":{"type":"key","key":"ArrowRight","down":true}});
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(key.to_string().into())).await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while running.scene.snapshot(&project)[1].x != 15.0 {
+            ensure!(tokio::time::Instant::now() < deadline, "WebSocket key did not move sprite");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let click = serde_json::json!({"type":"input","event":{"type":"mouse","x":15,"y":0,"down":true}});
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(click.to_string().into())).await?;
+        while running.scene.snapshot(&project)[1].costume != 1 {
+            ensure!(tokio::time::Instant::now() < deadline, "WebSocket click did not change costume");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let flag = serde_json::json!({"type":"input","event":{"type":"flag"}});
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(flag.to_string().into())).await?;
+        while running.scene.snapshot(&project)[1].x != 0.0 {
+            ensure!(tokio::time::Instant::now() < deadline, "WebSocket flag did not restart sprite");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        ws.close(None).await?;
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    // Also exercise release through the same public interface used on close.
+    running.scene.input.send(InputEvent::Release);
+    running.stop();
+    server.await??;
+    running.join()?;
+    test
+}
 use std::{sync::Arc, time::Duration};
 use webrtc::{
     api::{APIBuilder, media_engine::MediaEngine, setting_engine::SettingEngine},

@@ -43,6 +43,8 @@ pub(crate) struct Node {
 pub(crate) enum Hat {
     Flag,
     Broadcast(String),
+    Key(String),
+    Click,
 }
 #[derive(Debug)]
 pub(crate) struct Script {
@@ -174,6 +176,8 @@ impl Program {
                 }
                 let hat = match b.opcode.as_str() {
                     "event_whenflagclicked" => Hat::Flag,
+                    "event_whenkeypressed" => Hat::Key(b.field("KEY_OPTION")?.to_owned()),
+                    "event_whenthisspriteclicked" | "event_whenstageclicked" => Hat::Click,
                     "event_whenbroadcastreceived" => {
                         Hat::Broadcast(b.field("BROADCAST_OPTION")?.to_owned())
                     }
@@ -322,6 +326,7 @@ impl Lower<'_> {
                 "operator_not" => Some((0, "OPERAND")),
                 "operator_length" => Some((1, "STRING")),
                 "operator_round" => Some((2, "NUM")),
+                "sensing_keypressed" => Some((17, "KEY_OPTION")),
                 "operator_mathop" => {
                     let op = match b.field("OPERATOR")? {
                         "abs" => 3,
@@ -354,6 +359,12 @@ impl Lower<'_> {
                 "motion_direction" => 2,
                 "looks_size" => 3,
                 "sensing_timer" => 4,
+                "sensing_mousex" => 7,
+                "sensing_mousey" => 8,
+                "sensing_mousedown" => 9,
+                "sensing_keyoptions" => {
+                    return Ok(self.constant(ScratchValue::String(b.field("KEY_OPTION")?.into())));
+                }
                 "looks_costumenumbername" => {
                     if b.field("NUMBER_NAME")? == "number" {
                         5

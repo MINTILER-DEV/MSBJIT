@@ -17,6 +17,8 @@ cargo build --release --locked
 
 The native stage opens automatically for `.sb3` files and starts the green-flag scripts once the renderer is ready. Click its green flag to start them again, or the red square to stop scripts while keeping the window open. Closing the window exits the host. The stage keeps its 4:3 shape when resized, and mouse input accounts for scaling and letterboxing. Keyboard input goes to the focused window; losing focus releases held keys and mouse buttons.
 
+Windows uses Direct3D 12 by default, avoiding enumeration of optional Vulkan drivers. If needed, select a different wgpu backend explicitly, for example `$env:WGPU_BACKEND = "gl"` in PowerShell for OpenGL, or `"vulkan"` for Vulkan.
+
 In `interactive.sb3`, arrow keys move the sprite, clicking its visible pixels changes its costume, and space moves it to the mouse. The green flag returns it to the center. Rebuild this example with `python examples/make_interactive.py`.
 
 ## Running projects
@@ -83,6 +85,8 @@ cargo test --no-default-features
 cargo test --all-features -- --ignored
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
+# Browser input contract tests (Node.js 24):
+node --test tests/player.cjs
 ```
 
 Runtime tests execute generated native code for arithmetic/coercion, branches, nested loops, frame pacing, warp inheritance/watchdogs, cancellation, explicit waits, procedure arguments, broadcasts, string lifetime, and atomic scene publication. Streaming unit tests cover Annex-B parsing. Opt-in integration tests validate captured pixel colors and GPU → FFmpeg → WebSocket/host ICE → H.264 RTP delivery to a native WebRTC peer. These can run through a software wgpu adapter and libx264; browser compatibility and physical GPU encoder performance require separate validation.

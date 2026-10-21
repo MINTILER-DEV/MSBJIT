@@ -36,6 +36,12 @@ struct Args {
     /// Emit the final state and execution statistics as JSON
     #[arg(long)]
     json: bool,
+    /// Open an interactive native stage window (enabled by default for .sb3)
+    #[arg(long, conflicts_with_all = ["headless", "serve"])]
+    display: bool,
+    /// Run without the native stage window
+    #[arg(long)]
+    headless: bool,
     /// Serve a local browser player and WebSocket signaling (requires streaming feature)
     #[arg(long)]
     serve: Option<std::net::SocketAddr>,
@@ -70,7 +76,24 @@ fn main() -> Result<()> {
         "browser streaming requires: cargo run --features streaming -- <project> --serve 127.0.0.1:8080"
     );
     let project = Arc::new(Project::load(&args.project)?);
-    let running = runtime::spawn(
+    let display = args.display
+        || (cfg!(feature = "desktop")
+            && !args.headless
+            && args.serve.is_none()
+            && args
+                .project
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("sb3")));
+    ensure!(
+        !display || cfg!(feature = "desktop"),
+        "native display requires the desktop feature (enabled by default)"
+    );
+    let spawn = if display || args.serve.is_some() {
+        runtime::spawn_interactive
+    } else {
+        runtime::spawn
+    };
+    let running = spawn(
         project.clone(),
         RuntimeOptions {
             turbo: args.turbo,
@@ -82,6 +105,15 @@ fn main() -> Result<()> {
     )?;
     let scene = running.scene.clone();
     ctrlc::set_handler(move || scene.stopped.store(true, Ordering::Relaxed))?;
+    #[cfg(feature = "desktop")]
+    if display {
+        msbjit::desktop::show(
+            &project,
+            running.scene.clone(),
+            args.fps,
+            args.seconds.map(Duration::from_secs_f64),
+        )?;
+    }
     #[cfg(feature = "streaming")]
     if let Some(address) = args.serve {
         let executor = tokio::runtime::Builder::new_multi_thread()

@@ -3,39 +3,87 @@
 <title>MSBJIT · Scratch player</title>
 <style>
 body{font:16px system-ui;background:#111827;color:#e5e7eb;margin:0;display:grid;place-content:center;min-height:100vh;text-align:center}
-video{width:min(960px,96vw);aspect-ratio:4/3;background:white;border-radius:12px;box-shadow:0 12px 45px #0008}
-p{color:#9ca3af}button{background:#6366f1;color:white;border:0;border-radius:8px;padding:12px 24px;font:inherit;cursor:pointer}
+video{width:min(960px,96vw);aspect-ratio:4/3;object-fit:contain;background:white;border-radius:12px;box-shadow:0 12px 45px #0008;touch-action:none}
+video:focus-visible{outline:3px solid #818cf8;outline-offset:4px}
+p{color:#9ca3af}button{background:#6366f1;color:white;border:0;border-radius:8px;padding:12px 20px;font:inherit;cursor:pointer}button:disabled{opacity:.45;cursor:default}#flag{background:#15803d}#stop{background:#b91c1c}
 </style>
-<h1>MSBJIT</h1><video id="stage" autoplay muted playsinline></video>
-<p id="status">Ready to connect to the native runtime</p><div><button id="connect">Connect</button></div>
+<h1>MSBJIT</h1><video id="stage" tabindex="0" aria-label="Scratch stage. Click to focus, then use the keyboard." autoplay muted playsinline></video>
+<p id="status" role="status">Ready to connect to the native runtime</p>
+<div><button id="connect">Connect</button> <button id="flag" disabled>▶ Green flag</button> <button id="stop" disabled>■ Stop</button></div>
+<p>Click the stage to focus. Use letters, numbers, arrows, space, Enter, and the mouse.</p>
 <script>
 const status = document.querySelector('#status'), button = document.querySelector('#connect');
-let peer, socket;
+const stage = document.querySelector('#stage'), flag = document.querySelector('#flag'), stop = document.querySelector('#stop');
+let peer, socket, mouseDown = false;
+function send(event) {
+  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({type:'input', event}));
+}
+function release() {mouseDown = false; send({type:'release'});}
+flag.onclick = () => {release(); send({type:'flag'}); stage.focus();};
+stop.onclick = () => {release(); send({type:'stop'});};
+function keyName(key) {
+  const names = {ArrowUp:'up arrow',ArrowDown:'down arrow',ArrowLeft:'left arrow',ArrowRight:'right arrow',' ':'space',Enter:'enter'};
+  return names[key] || (/^[a-z0-9]$/i.test(key) ? key.toLowerCase() : null);
+}
+stage.addEventListener('keydown', e => {
+  const key = keyName(e.key);
+  if (key) {e.preventDefault(); if (!e.repeat) send({type:'key',key,down:true});}
+});
+stage.addEventListener('keyup', e => {
+  const key = keyName(e.key);
+  if (key) {e.preventDefault(); send({type:'key',key,down:false});}
+});
+function pointer(e, down) {
+  const r = stage.getBoundingClientRect();
+  const x = (e.clientX-r.left)/r.width*480-240, y = 180-(e.clientY-r.top)/r.height*360;
+  const inside = x >= -240 && x <= 240 && y >= -180 && y <= 180;
+  send({type:'mouse',x:Math.max(-240,Math.min(240,x)),y:Math.max(-180,Math.min(180,y)),down:down && inside});
+}
+stage.addEventListener('pointerdown', e => {
+  if (e.button !== 0 || !e.isPrimary) return;
+  stage.focus(); stage.setPointerCapture(e.pointerId); mouseDown = true; pointer(e,true); e.preventDefault();
+});
+stage.addEventListener('pointermove', e => {if(e.isPrimary) pointer(e,mouseDown);});
+stage.addEventListener('pointerup', e => {if(e.isPrimary) {mouseDown = false; pointer(e,false);}});
+stage.addEventListener('pointercancel', release);
+stage.addEventListener('lostpointercapture', () => {mouseDown = false; send({type:'mouse',x:0,y:0,down:false});});
+stage.addEventListener('blur', release);
+stage.addEventListener('contextmenu', e => e.preventDefault());
+window.addEventListener('blur', release);
+document.addEventListener('visibilitychange', () => {if(document.hidden) release();});
 button.onclick = async () => {
-  button.disabled = true;
+  button.disabled = true; flag.disabled = stop.disabled = true;
+  release();
   try {
     peer?.close();
     if (socket) {socket.onclose = null; socket.close();}
     peer = new RTCPeerConnection({iceServers: []});
     peer.addTransceiver('video', {direction: 'recvonly'});
-    peer.ontrack = e => { document.querySelector('#stage').srcObject = e.streams[0] || new MediaStream([e.track]); };
-    peer.onconnectionstatechange = () => { status.textContent = `Connection: ${peer.connectionState}`; };
+    peer.ontrack = e => {stage.srcObject = e.streams[0] || new MediaStream([e.track]);};
+    peer.onconnectionstatechange = () => {status.textContent = `Connection: ${peer.connectionState}`;};
     socket = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
-    await new Promise((resolve, reject) => { socket.onopen = resolve; socket.onerror = reject; });
+    await new Promise((resolve, reject) => {socket.onopen = resolve; socket.onerror = reject;});
     socket.onmessage = async e => {
-      try { const answer = JSON.parse(e.data); if (answer.type === 'answer') await peer.setRemoteDescription(answer); }
-      catch (error) { status.textContent = error.message; }
+      try {
+        const answer = JSON.parse(e.data);
+        if (answer.type === 'answer') {
+          await peer.setRemoteDescription(answer);
+          flag.disabled = stop.disabled = false;
+          status.textContent = 'Connected. Press Green flag to start the project.';
+          stage.focus();
+        }
+      } catch (error) {status.textContent = error.message;}
     };
-    socket.onclose = () => { status.textContent = 'Signaling disconnected'; peer.close(); button.disabled = false; };
+    socket.onclose = () => {mouseDown = false; status.textContent = 'Disconnected'; peer.close(); button.disabled = false; flag.disabled = stop.disabled = true;};
     await peer.setLocalDescription(await peer.createOffer());
     if (peer.iceGatheringState !== 'complete') await new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('Local ICE gathering timed out')), 10000);
-      peer.addEventListener('icegatheringstatechange', () => { if (peer.iceGatheringState === 'complete') { clearTimeout(timer); resolve(); } });
+      peer.addEventListener('icegatheringstatechange', () => {if (peer.iceGatheringState === 'complete') {clearTimeout(timer); resolve();}});
     });
     socket.send(JSON.stringify(peer.localDescription));
     status.textContent = 'Connecting over local UDP…';
-  } catch (error) { status.textContent = error.message || 'Connection failed'; peer?.close(); socket?.close(); }
-  finally { button.disabled = false; }
+  } catch (error) {status.textContent = error.message || 'Connection failed'; peer?.close(); socket?.close();}
+  finally {button.disabled = false;}
 };
-window.onbeforeunload = () => { peer?.close(); socket?.close(); };
+window.addEventListener('beforeunload', () => {release(); peer?.close(); socket?.close();});
 </script></html>

@@ -16,8 +16,9 @@ struct Costume {
     height: f64,
     center: [f64; 2],
     resolution: f64,
+    alpha: Vec<u8>,
 }
-pub(super) struct Renderer {
+pub(crate) struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
@@ -29,7 +30,19 @@ pub(super) struct Renderer {
 }
 impl Renderer {
     pub async fn new(project: &Project) -> Result<Self> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        // Avoid loading optional Vulkan ICDs when opening a Windows stage.
+        // A broken installed ICD can crash inside driver enumeration before
+        // wgpu has an opportunity to return an adapter error.
+        let descriptor = wgpu::InstanceDescriptor {
+            backends: if cfg!(target_os = "windows") {
+                wgpu::Backends::DX12
+            } else {
+                wgpu::Backends::all()
+            },
+            ..Default::default()
+        }
+        .with_env();
+        let instance = wgpu::Instance::new(&descriptor);
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -126,7 +139,7 @@ impl Renderer {
             for costume in &target.costumes {
                 let bytes = project.assets.get(&costume.md5ext).with_context(|| {
                     format!(
-                        "costume {} has no asset; streaming requires an .sb3 archive",
+                        "costume {} has no asset; rendering requires an .sb3 archive",
                         costume.md5ext
                     )
                 })?;
@@ -181,6 +194,7 @@ impl Renderer {
                     height: height as f64,
                     center: [costume.rotation_center_x, costume.rotation_center_y],
                     resolution: costume.bitmap_resolution,
+                    alpha: rgba.chunks_exact(4).map(|p| p[3]).collect(),
                 });
             }
             costumes.push(list);
@@ -228,6 +242,52 @@ impl Renderer {
             costumes,
             order,
         })
+    }
+    /// Pick the frontmost visible, nontransparent costume pixel. Transform the
+    /// point by the inverse of the same rotation/size/flip used for drawing.
+    pub fn hit_test(&self, states: &[SpriteState], x: f64, y: f64) -> Option<usize> {
+        if !x.is_finite() || !y.is_finite() || x.abs() > 240.0 || y.abs() > 180.0 {
+            return None;
+        }
+        for &id in self.order.iter().rev() {
+            let state = &states[id];
+            if state.is_stage {
+                return Some(id);
+            }
+            if !state.visible {
+                continue;
+            }
+            let Some(costume) = self.costumes[id].get(state.costume) else {
+                continue;
+            };
+            let scale = state.size / 100.0 / costume.resolution;
+            if !scale.is_finite() || scale <= 0.0 {
+                continue;
+            }
+            let angle = if state.rotation_style == "all around" {
+                (90.0 - state.direction).to_radians()
+            } else {
+                0.0
+            };
+            let (sin, cos) = angle.sin_cos();
+            let (dx, dy) = (x - state.x, y - state.y);
+            let flip = if state.rotation_style == "left-right" && state.direction < 0.0 {
+                -1.0
+            } else {
+                1.0
+            };
+            let px = (dx * cos + dy * sin) / scale / flip + costume.center[0];
+            let py = costume.center[1] - (-dx * sin + dy * cos) / scale;
+            if px >= 0.0
+                && py >= 0.0
+                && px < costume.width
+                && py < costume.height
+                && costume.alpha[py as usize * costume.width as usize + px as usize] > 0
+            {
+                return Some(id);
+            }
+        }
+        None
     }
     pub fn capture(&mut self, states: &[SpriteState]) -> Result<Vec<u8>> {
         let mut vertices = Vec::with_capacity(states.len() * 6);
@@ -377,9 +437,9 @@ fn decode(name: &str, data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[tokio::test]
+    #[test]
     #[ignore = "requires a wgpu graphics adapter"]
-    async fn gpu_capture_contains_backdrop_and_costume() -> Result<()> {
+    fn gpu_capture_contains_backdrop_and_costume() -> Result<()> {
         let project = std::sync::Arc::new(Project::load(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/examples/demo.sb3"
@@ -392,11 +452,46 @@ mod tests {
             },
         )?
         .join()?;
-        let mut renderer = Renderer::new(&project).await?;
+        let mut renderer = pollster::block_on(Renderer::new(&project))?;
         let rgba = renderer.capture(&report.sprites)?;
         let pixel = |x: usize, y: usize| &rgba[(y * 480 + x) * 4..(y * 480 + x) * 4 + 4];
         assert_eq!(pixel(300, 100), &[232, 238, 248, 255]);
         assert_eq!(pixel(40, 180), &[99, 102, 241, 255]);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a wgpu graphics adapter"]
+    fn click_picking_follows_costume_alpha_and_transforms() -> Result<()> {
+        let project = std::sync::Arc::new(Project::load(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/interactive.sb3"
+        ))?);
+        let report = crate::runtime::spawn(
+            project.clone(),
+            crate::runtime::RuntimeOptions {
+                max_steps: Some(0),
+                ..Default::default()
+            },
+        )?
+        .join()?;
+        let renderer = pollster::block_on(Renderer::new(&project))?;
+        let mut states = report.sprites;
+        assert_eq!(renderer.hit_test(&states, 0.0, 0.0), Some(1));
+        assert_eq!(renderer.hit_test(&states, 31.0, 31.0), Some(0));
+        assert_eq!(renderer.hit_test(&states, 250.0, 0.0), None);
+        states[1].x = 80.0;
+        states[1].y = -50.0;
+        states[1].direction = 0.0;
+        states[1].size = 200.0;
+        assert_eq!(renderer.hit_test(&states, 80.0, -50.0), Some(1));
+        assert_eq!(renderer.hit_test(&states, 130.0, -50.0), Some(1));
+        assert_eq!(renderer.hit_test(&states, 0.0, 0.0), Some(0));
+        states[1].rotation_style = "left-right".into();
+        states[1].direction = -90.0;
+        assert_eq!(renderer.hit_test(&states, 80.0, -50.0), Some(1));
+        states[1].visible = false;
+        assert_eq!(renderer.hit_test(&states, 80.0, -50.0), Some(0));
         Ok(())
     }
 }

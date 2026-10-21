@@ -1,7 +1,7 @@
 //! Local-only WebRTC signaling and a bounded render/capture/encode pipeline.
 mod encoder;
-mod render;
-use crate::{project::Project, runtime::SharedScene};
+use crate::render;
+use crate::{input::InputEvent, project::Project, runtime::SharedScene};
 use anyhow::{Context, Result, ensure};
 use axum::{
     Router,
@@ -48,6 +48,8 @@ pub struct StreamOptions {
 }
 #[derive(Clone)]
 struct ServerState {
+    scene: Arc<SharedScene>,
+    clicks: tokio::sync::mpsc::Sender<(f64, f64)>,
     samples: broadcast::Sender<EncodedFrame>,
     shutdown: watch::Receiver<bool>,
     clients: Arc<AtomicUsize>,
@@ -70,7 +72,10 @@ pub async fn serve(
     let mut encoder =
         encoder::Encoder::start(&options.encoder, options.fps, &options.vaapi_device)?;
     let (shutdown, shutdown_rx) = watch::channel(false);
+    let (clicks, mut pointer_clicks) = tokio::sync::mpsc::channel(256);
     let state = ServerState {
+        scene: scene.clone(),
+        clicks,
         samples: encoder.samples.clone(),
         shutdown: shutdown_rx.clone(),
         clients: Arc::new(AtomicUsize::new(0)),
@@ -105,8 +110,14 @@ pub async fn serve(
         if server.is_finished() {
             break Err(anyhow::anyhow!("signaling server stopped unexpectedly"));
         }
+        let states = scene.snapshot(&project);
+        while let Ok((x, y)) = pointer_clicks.try_recv() {
+            if let Some(target) = renderer.hit_test(&states, x, y) {
+                scene.input.send(InputEvent::Click { target });
+            }
+        }
         let result = renderer
-            .capture(&scene.snapshot(&project))
+            .capture(&states)
             .and_then(|frame| encoder.submit(frame));
         if let Err(error) = result {
             break Err(error);
@@ -196,6 +207,7 @@ async fn session(socket: WebSocket, state: ServerState) -> Result<()> {
     });
     let (mut output, mut input) = socket.split();
     let mut shutdown = state.shutdown;
+    let mut mouse_down = false;
     let result = async {
         loop {
             let message = tokio::select! {
@@ -209,6 +221,25 @@ async fn session(socket: WebSocket, state: ServerState) -> Result<()> {
                 Message::Text(text) => {
                     let message: serde_json::Value = serde_json::from_str(&text)?;
                     match message["type"].as_str() {
+                        Some("input") => {
+                            let event: InputEvent =
+                                serde_json::from_value(message["event"].clone())?;
+                            match event {
+                                InputEvent::Mouse { x, y, down } => {
+                                    if down && !mouse_down && x.is_finite() && y.is_finite() {
+                                        let _ = state.clicks.try_send((x, y));
+                                    }
+                                    mouse_down = down;
+                                    state.scene.input.send(InputEvent::Mouse { x, y, down });
+                                }
+                                InputEvent::Click { .. } => {} // Hit targets are selected by the host.
+                                InputEvent::Release => {
+                                    mouse_down = false;
+                                    state.scene.input.send(InputEvent::Release);
+                                }
+                                event => state.scene.input.send(event),
+                            }
+                        }
                         Some("offer") => {
                             let sdp = message["sdp"].as_str().context("missing offer SDP")?;
                             peer.set_remote_description(RTCSessionDescription::offer(sdp.into())?)
@@ -243,6 +274,7 @@ async fn session(socket: WebSocket, state: ServerState) -> Result<()> {
         Ok::<_, anyhow::Error>(())
     }
     .await;
+    state.scene.input.send(InputEvent::Release);
     media_task.abort();
     rtcp.abort();
     let _ = peer.close().await;

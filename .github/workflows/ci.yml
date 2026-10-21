@@ -15,6 +15,10 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libx11-dev libxkbcommon-dev libwayland-dev
       - run: cargo fmt --check
-      - run: cargo test --locked --all-features
+      - run: cargo test --locked --all-features --jobs 2
       - run: cargo test --locked --no-default-features
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: node --test tests/player.cjs
