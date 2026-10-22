@@ -169,6 +169,68 @@ impl CostumePixels {
         self.world_bounds(state)
             .is_some_and(|[l, b, r, t]| l < -240.0 || b < -180.0 || r > 240.0 || t > 180.0)
     }
+    fn world_alpha(
+        &self,
+        state: &SpriteState,
+        transform: (f64, f64, f64, f64),
+        linear: bool,
+        x: f64,
+        y: f64,
+    ) -> bool {
+        let (scale, sin, cos, flip) = transform;
+        let (dx, dy) = (x - state.x, y - state.y);
+        let px = (dx * cos + dy * sin) / scale / flip + self.center[0];
+        let py = self.center[1] - (-dx * sin + dy * cos) / scale;
+        if px < 0.0 || py < 0.0 || px >= self.width as f64 || py >= self.height as f64 {
+            return false;
+        }
+        let uv = state.effects.point(
+            [px / self.width as f64, py / self.height as f64],
+            [
+                self.width as f64 / self.resolution,
+                self.height as f64 / self.resolution,
+            ],
+        );
+        // Sensing uses transformed alpha and deliberately ignores ghost/color.
+        self.sample(uv, linear)[3] > 0.0
+    }
+    pub fn contains_point(&self, state: &SpriteState, x: f64, y: f64) -> bool {
+        self.transform(state)
+            .is_some_and(|transform| self.world_alpha(state, transform, self.linear(state), x, y))
+    }
+    pub fn touching_sprite(
+        &self,
+        state: &SpriteState,
+        other: &Self,
+        other_state: &SpriteState,
+    ) -> bool {
+        if !state.visible || !other_state.visible {
+            return false;
+        }
+        let (Some(a), Some(b), Some(ta), Some(tb)) = (
+            self.world_bounds(state),
+            other.world_bounds(other_state),
+            self.transform(state),
+            other.transform(other_state),
+        ) else {
+            return false;
+        };
+        let left = a[0].max(b[0]).max(-240.0).floor() as i32;
+        let right = a[2].min(b[2]).min(240.0).ceil() as i32;
+        let bottom = a[1].max(b[1]).max(-180.0).floor() as i32;
+        let top = a[3].min(b[3]).min(180.0).ceil() as i32;
+        let (la, lb) = (self.linear(state), other.linear(other_state));
+        for y in bottom..=top {
+            for x in left..=right {
+                if self.world_alpha(state, ta, la, x as f64, y as f64)
+                    && other.world_alpha(other_state, tb, lb, x as f64, y as f64)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
     pub fn stamp(&self, state: &SpriteState, canvas: &mut PenCanvas) {
         let Some([l, b, r, t]) = self.world_bounds(state) else {
             return;
@@ -219,6 +281,27 @@ impl CostumePixels {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn collision_sensing_uses_alpha_visibility_and_ignores_ghost() {
+        let mut rgba = vec![255; 3 * 3 * 4];
+        rgba[(3 + 1) * 4 + 3] = 0;
+        let a = CostumePixels::new(3, 3, rgba, [1.5, 1.5], 1.0);
+        let b = CostumePixels::new(1, 1, vec![255; 4], [0.5, 0.5], 1.0);
+        let mut sa = state();
+        let mut sb = state();
+        sa.visible = true;
+        sb.visible = true;
+        assert!(!a.touching_sprite(&sa, &b, &sb));
+        sb.x = 1.0;
+        assert!(a.touching_sprite(&sa, &b, &sb));
+        sa.effects.ghost = 100.0;
+        assert!(a.touching_sprite(&sa, &b, &sb));
+        sa.visible = false;
+        assert!(!a.touching_sprite(&sa, &b, &sb));
+        assert!(!a.contains_point(&sa, 0.0, 0.0));
+        assert!(a.contains_point(&sa, 1.0, 0.0));
+        assert!(!a.contains_point(&sa, 20.0, 0.0));
+    }
     #[test]
     fn svg_sampling_respects_rotation_style_when_direction_is_not_axis_aligned() {
         let mut pixels = CostumePixels::new(1, 1, vec![255; 4], [0.0, 0.0], 1.0);

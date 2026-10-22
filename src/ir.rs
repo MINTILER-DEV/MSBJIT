@@ -32,6 +32,8 @@ pub(crate) enum Op {
     ForEachCheck(usize, usize, Expr, usize, usize),
     Wait(Expr),
     Glide(Expr, Expr, Expr),
+    GlideTo(Expr, Expr),
+    PlayUntilDone(Expr),
     DeleteClone,
     Yield(usize),
     Broadcast(Expr, bool),
@@ -389,6 +391,16 @@ impl Lower<'_> {
                 "operator_random" => Some((13, "FROM", "TO")),
                 _ => None,
             };
+            if opcode == "sensing_of" {
+                let property = b.field("PROPERTY")?.to_owned();
+                let object = self.input(b, "OBJECT")?.clone();
+                let property = self.constant(ScratchValue::String(property));
+                return Ok(Expr::Binary(
+                    14,
+                    Box::new(property),
+                    Box::new(self.expr(&object, depth + 1)?),
+                ));
+            }
             if let Some((op, a, c)) = binary {
                 let a = self.input(b, a)?.clone();
                 let c = self.input(b, c)?.clone();
@@ -442,6 +454,7 @@ impl Lower<'_> {
                 "sensing_dayssince2000" => 10,
                 "sensing_username" => 11,
                 "translate_getViewerLanguage" => 12,
+                "sound_volume" => 13,
                 "sensing_touchingobjectmenu" => {
                     return Ok(
                         self.constant(ScratchValue::String(b.field("TOUCHINGOBJECTMENU")?.into()))
@@ -449,6 +462,17 @@ impl Lower<'_> {
                 }
                 "sound_sounds_menu" => {
                     return Ok(self.constant(ScratchValue::String(b.field("SOUND_MENU")?.into())));
+                }
+                "motion_goto_menu"
+                | "motion_glideto_menu"
+                | "motion_pointtowards_menu"
+                | "sensing_of_object_menu" => {
+                    let field = match opcode.as_str() {
+                        "motion_pointtowards_menu" => "TOWARDS",
+                        "sensing_of_object_menu" => "OBJECT",
+                        _ => "TO",
+                    };
+                    return Ok(self.constant(ScratchValue::String(b.field(field)?.into())));
                 }
                 "control_create_clone_of_menu" => {
                     return Ok(self.constant(ScratchValue::String(b.field("CLONE_OPTION")?.into())));
@@ -677,6 +701,14 @@ impl Lower<'_> {
                 s => bail!("unknown stop option {s}"),
             }),
             "motion_movesteps" => Op::Action(0, self.expr_input(b, "STEPS")?, self.zero()),
+            "motion_goto" => Op::Action(42, self.expr_input(b, "TO")?, self.zero()),
+            "motion_pointtowards" => Op::Action(43, self.expr_input(b, "TOWARDS")?, self.zero()),
+            "motion_glideto" => Op::GlideTo(self.expr_input(b, "SECS")?, self.expr_input(b, "TO")?),
+            "looks_goforwardbackwardlayers" => {
+                let direction =
+                    self.constant(ScratchValue::String(b.field("FORWARD_BACKWARD")?.into()));
+                Op::Action(44, direction, self.expr_input(b, "NUM")?)
+            }
             "motion_glidesecstoxy" => Op::Glide(
                 self.expr_input(b, "SECS")?,
                 self.expr_input(b, "X")?,
@@ -749,6 +781,23 @@ impl Lower<'_> {
             "pen_changePenSizeBy" => Op::Action(25, self.expr_input(b, "SIZE")?, self.zero()),
             "pen_stamp" => Op::Action(26, self.zero(), self.zero()),
             "sound_play" => Op::Action(27, self.expr_input(b, "SOUND_MENU")?, self.zero()),
+            "sound_playuntildone" => Op::PlayUntilDone(self.expr_input(b, "SOUND_MENU")?),
+            "sound_stopallsounds" => Op::Action(36, self.zero(), self.zero()),
+            "sound_setvolumeto" => Op::Action(37, self.expr_input(b, "VOLUME")?, self.zero()),
+            "sound_changevolumeby" => Op::Action(38, self.expr_input(b, "VOLUME")?, self.zero()),
+            "sound_seteffectto" | "sound_changeeffectby" => {
+                let effect = self.constant(ScratchValue::String(b.field("EFFECT")?.into()));
+                Op::Action(
+                    if b.opcode == "sound_seteffectto" {
+                        39
+                    } else {
+                        40
+                    },
+                    effect,
+                    self.expr_input(b, "VALUE")?,
+                )
+            }
+            "sound_cleareffects" => Op::Action(41, self.zero(), self.zero()),
             s => bail!("unsupported command {s}"),
         };
         self.add(op, next)

@@ -54,6 +54,8 @@ pub struct Target {
     pub costumes: Vec<Costume>,
     #[serde(default)]
     pub sounds: Vec<Sound>,
+    #[serde(default = "size")]
+    pub volume: f64,
     #[serde(default)]
     pub current_costume: usize,
     #[serde(default)]

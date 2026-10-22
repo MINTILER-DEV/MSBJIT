@@ -1,5 +1,5 @@
 use crate::{
-    audio::AudioPlayer,
+    audio::{AudioPlayer, SoundState},
     input::{InputController, InputEvent, InputState},
     ir::{Hat, Program},
     jit::NativeProgram,
@@ -281,6 +281,7 @@ struct Fiber {
     waiting: HashSet<u64>,
     done: bool,
     glide: Option<Glide>,
+    sound_wait: Option<u64>,
 }
 struct Glide {
     start: Instant,
@@ -305,6 +306,7 @@ impl Fiber {
             waiting: HashSet::new(),
             done: false,
             glide: None,
+            sound_wait: None,
         }
     }
     fn warp(&self) -> bool {
@@ -360,6 +362,7 @@ pub(crate) struct Vm {
     next_sprite_id: usize,
     pens: Vec<PenState>,
     audio: AudioPlayer,
+    sound_states: Vec<SoundState>,
     #[cfg(feature = "graphics")]
     costume_pixels: HashMap<(usize, usize), Arc<CostumePixels>>,
     #[cfg(feature = "graphics")]
@@ -419,6 +422,14 @@ impl Vm {
             next_sprite_id: project.targets.len(),
             pens: vec![PenState::default(); project.targets.len()],
             audio: AudioPlayer::default(),
+            sound_states: project
+                .targets
+                .iter()
+                .map(|t| SoundState {
+                    volume: t.volume.clamp(0.0, 100.0),
+                    ..Default::default()
+                })
+                .collect(),
             #[cfg(feature = "graphics")]
             costume_pixels: HashMap::new(),
             #[cfg(feature = "graphics")]
@@ -449,6 +460,11 @@ impl Vm {
         }
     }
     fn clear_effects(&mut self) {
+        for (id, state) in self.sound_states.iter_mut().enumerate() {
+            state.pitch = 0.0;
+            state.pan = 0.0;
+            self.audio.configure(id, *state);
+        }
         for s in &mut self.sprites {
             s.effects = Default::default();
         }
@@ -520,17 +536,20 @@ impl Vm {
             }
         }
         let pen = self.pens[source].clone();
+        let sound_state = self.sound_states[source];
         let index = if let Some(i) = self.clones.iter().position(Option::is_none) {
             let target = self.project.targets.len() + i;
             self.clones[i] = Some(data);
             self.sprites[target] = sprite;
             self.pens[target] = pen;
+            self.sound_states[target] = sound_state;
             target
         } else {
             let target = self.sprites.len();
             self.clones.push(Some(data));
             self.sprites.push(sprite);
             self.pens.push(pen);
+            self.sound_states.push(sound_state);
             target
         };
         for i in 0..self.sprites.len() {
@@ -546,6 +565,7 @@ impl Vm {
         self.sprites[target].visible = false;
         self.clones[target - self.project.targets.len()] = None;
         self.pens[target].down = false;
+        self.audio.stop_target(target);
         self.publish_sprite(target);
     }
     fn clear_clones(&mut self) {
@@ -581,6 +601,96 @@ impl Vm {
                 .line(&self.pens[target], old, (x, y));
         }
         self.publish_sprite(target);
+    }
+    fn named_sprite(&self, name: &str) -> Option<usize> {
+        if name == "_myself_" {
+            return Some(self.current.target);
+        }
+        if name == "_stage_" {
+            return Some(self.program.stage);
+        }
+        self.project.targets.iter().position(|t| t.name == name)
+    }
+    fn destination(&mut self, name: &str) -> Option<(f64, f64)> {
+        match name {
+            "_mouse_" => Some((self.input.x, self.input.y)),
+            "_random_" => {
+                self.random ^= self.random << 13;
+                self.random ^= self.random >> 7;
+                self.random ^= self.random << 17;
+                let x = (self.random % 481) as f64 - 240.0;
+                self.random ^= self.random << 13;
+                self.random ^= self.random >> 7;
+                self.random ^= self.random << 17;
+                Some((x, (self.random % 361) as f64 - 180.0))
+            }
+            _ => self
+                .named_sprite(name)
+                .map(|i| (self.sprites[i].x, self.sprites[i].y)),
+        }
+    }
+    fn relative_layer(&mut self, delta: f64) {
+        let target = self.current.target;
+        if self.sprites[target].is_stage {
+            return;
+        }
+        let mut order: Vec<_> = self
+            .sprites
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| (s.active && !s.is_stage).then_some(i))
+            .collect();
+        order.sort_by_key(|&i| self.sprites[i].layer_order);
+        let Some(old) = order.iter().position(|&i| i == target) else {
+            return;
+        };
+        order.remove(old);
+        let new = (old as f64 + delta).clamp(0.0, order.len() as f64) as usize;
+        order.insert(new, target);
+        for (layer, id) in order.into_iter().enumerate() {
+            self.sprites[id].layer_order = layer as i64;
+            self.publish_sprite(id);
+        }
+    }
+    fn property(&mut self, property: &str, object: &str) -> u64 {
+        let Some(target) = self.named_sprite(object) else {
+            return number(0.0);
+        };
+        let sprite = &self.sprites[target];
+        let value = match property {
+            "x position" => ScratchValue::Number(sprite.x),
+            "y position" => ScratchValue::Number(sprite.y),
+            "direction" => ScratchValue::Number(sprite.direction),
+            "size" => ScratchValue::Number(sprite.size),
+            "volume" => ScratchValue::Number(self.sound_states[target].volume),
+            "costume #" | "backdrop #" => ScratchValue::Number(sprite.costume as f64 + 1.0),
+            "costume name" | "backdrop name" => ScratchValue::String(
+                self.project.targets[sprite.target]
+                    .costumes
+                    .get(sprite.costume)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default(),
+            ),
+            _ => {
+                let Some(slot) = self
+                    .program
+                    .variable_names
+                    .iter()
+                    .position(|(owner, _, name)| *owner == sprite.target && name == property)
+                else {
+                    return number(0.0);
+                };
+                return if target >= self.project.targets.len() {
+                    self.clones[target - self.project.targets.len()]
+                        .as_ref()
+                        .unwrap()
+                        .vars[slot]
+                } else {
+                    self.vars[slot]
+                };
+            }
+        };
+        self.program.values.encode(value)
     }
     fn publish_effects(&self, id: usize) {
         if id >= self.project.targets.len() {
@@ -651,6 +761,7 @@ impl Vm {
         while (!fibers.is_empty() || self.interactive)
             && !self.shared.stopped.load(Ordering::Relaxed)
         {
+            self.audio.tick();
             // Keep monitors fresh after the last script finishes as well as
             // during execution; an interactive player can remain idle here.
             if self.monitor_published.elapsed() >= Duration::from_millis(16) {
@@ -748,6 +859,13 @@ impl Vm {
                 {
                     index += 1;
                     continue;
+                }
+                if let Some(sound) = fibers[index].sound_wait {
+                    if self.audio.playing(sound) {
+                        index += 1;
+                        continue;
+                    }
+                    fibers[index].sound_wait = None;
                 }
                 std::mem::swap(&mut self.current, &mut fibers[index]);
                 if let Some(glide) = &self.current.glide {
@@ -909,17 +1027,20 @@ impl Vm {
                 if Instant::now() > tick_deadline + tick {
                     tick_deadline = Instant::now();
                 }
-            } else if fibers
-                .iter()
-                .all(|f| !f.waiting.is_empty() || f.wake.is_some_and(|w| w > Instant::now()))
-            {
-                self.sleep_until(
-                    fibers
-                        .iter()
-                        .filter_map(|f| f.wake)
-                        .min()
-                        .unwrap_or(Instant::now() + Duration::from_millis(1)),
-                );
+            } else if fibers.iter().all(|f| {
+                !f.waiting.is_empty()
+                    || f.sound_wait.is_some()
+                    || f.wake.is_some_and(|w| w > Instant::now())
+            }) {
+                let mut next = fibers
+                    .iter()
+                    .filter_map(|f| f.wake)
+                    .min()
+                    .unwrap_or(Instant::now() + Duration::from_millis(1));
+                if fibers.iter().any(|f| f.sound_wait.is_some()) {
+                    next = next.min(Instant::now() + Duration::from_millis(1));
+                }
+                self.sleep_until(next);
             }
         }
         self.publish();
@@ -1035,27 +1156,85 @@ impl Vm {
             .costume_pixels(self.current.target)?
             .is_some_and(|p| p.touching_edge(&self.sprites[self.current.target])))
     }
-    fn play_sound(&mut self, value: &ScratchValue) -> Result<()> {
-        if !self.interactive {
-            return Ok(());
+    fn touching_object(&mut self, name: &str) -> Result<bool> {
+        if name == "_edge_" {
+            return self.touching_edge();
         }
-        let sounds = &self.project.targets[self.sprites[self.current.target].target].sounds;
+        let target = self.current.target;
+        if name == "_mouse_" {
+            return Ok(self.costume_pixels(target)?.is_some_and(|pixels| {
+                pixels.contains_point(&self.sprites[target], self.input.x, self.input.y)
+            }));
+        }
+        let Some(origin) = self.named_sprite(name) else {
+            return Ok(false);
+        };
+        if !self.sprites[target].visible {
+            return Ok(false);
+        }
+        let Some(pixels) = self.costume_pixels(target)? else {
+            return Ok(false);
+        };
+        for other in 0..self.sprites.len() {
+            if other == target
+                || !self.sprites[other].active
+                || !self.sprites[other].visible
+                || self.sprites[other].target != origin
+            {
+                continue;
+            }
+            if let Some(other_pixels) = self.costume_pixels(other)?
+                && pixels.touching_sprite(
+                    &self.sprites[target],
+                    &other_pixels,
+                    &self.sprites[other],
+                )
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    fn play_sound(&mut self, value: &ScratchValue) -> Result<Option<u64>> {
+        let target = self.current.target;
+        let origin = self.sprites[target].target;
+        let sounds = &self.project.targets[origin].sounds;
         let name = value.text();
-        let sound = sounds.iter().find(|s| s.name == name).or_else(|| {
-            let n = value.to_number();
-            (n.is_finite() && n >= 1.0)
-                .then(|| sounds.get((n as usize - 1) % sounds.len().max(1)))
-                .flatten()
+        let index = sounds.iter().position(|s| s.name == name).or_else(|| {
+            if sounds.is_empty() {
+                return None;
+            }
+            let text = name.trim_start();
+            let digits = text
+                .strip_prefix(['+', '-'])
+                .unwrap_or(text)
+                .bytes()
+                .take_while(u8::is_ascii_digit)
+                .count();
+            if digits == 0 {
+                return None;
+            }
+            let end = digits + usize::from(text.starts_with(['+', '-']));
+            let n = text[..end].parse::<f64>().ok()?;
+            n.is_finite()
+                .then(|| (n - 1.0).rem_euclid(sounds.len() as f64) as usize)
         });
-        if let Some(sound) = sound {
-            self.audio.play(
-                self.project
-                    .assets
-                    .get(&sound.md5ext)
-                    .context("sound asset is missing")?,
-            )?;
+        if let Some(index) = index {
+            return self
+                .audio
+                .play(
+                    target,
+                    (origin, index),
+                    self.project
+                        .assets
+                        .get(&sounds[index].md5ext)
+                        .context("sound asset is missing")?,
+                    self.interactive,
+                    self.sound_states[target],
+                )
+                .map(Some);
         }
-        Ok(())
+        Ok(None)
     }
     fn fail(&mut self, message: &str) {
         self.error = Some(message.into());
@@ -1287,6 +1466,28 @@ pub(crate) extern "C" fn rt_glide(vm: &mut Vm, seconds: f64, x: f64, y: f64, nex
     vm.current.pc = next as usize;
     1
 }
+pub(crate) extern "C" fn rt_play_until_done(vm: &mut Vm, sound: u64, next: u32) -> u32 {
+    match vm.play_sound(&vm.value(sound)) {
+        Ok(Some(sound)) => {
+            vm.current.sound_wait = Some(sound);
+            vm.current.pc = next as usize;
+            vm.jit.pc = next;
+            1
+        }
+        Ok(None) => 0,
+        Err(error) => {
+            vm.fail(&error.to_string());
+            1
+        }
+    }
+}
+pub(crate) extern "C" fn rt_glide_to(vm: &mut Vm, seconds: f64, target: u64, next: u32) -> u32 {
+    if let Some((x, y)) = vm.destination(&vm.value(target).text()) {
+        rt_glide(vm, seconds, x, y, next)
+    } else {
+        0
+    }
+}
 pub(crate) extern "C" fn rt_delete_clone(vm: &mut Vm) -> u32 {
     if vm.current.target < vm.project.targets.len() {
         return 0;
@@ -1323,6 +1524,9 @@ pub(crate) extern "C" fn rt_stop(vm: &mut Vm, mode: u32) {
     }
 }
 pub(crate) extern "C" fn rt_binary(vm: &mut Vm, op: u32, a: u64, b: u64) -> u64 {
+    if op == 14 {
+        return vm.property(&vm.value(a).text(), &vm.value(b).text());
+    }
     if (5..=7).contains(&op) {
         let ordering = vm.program.values.compare(a, b);
         return vm.program.values.encode(ScratchValue::Boolean(match op {
@@ -1410,13 +1614,7 @@ pub(crate) extern "C" fn rt_unary(vm: &mut Vm, op: u32, a: u64) -> u64 {
     }
     let a = vm.value(a);
     if op == 18 {
-        let result = if a.text() == "_edge_" {
-            vm.touching_edge()
-        } else {
-            Err(anyhow!(
-                "touching-object currently supports the stage edge only"
-            ))
-        };
+        let result = vm.touching_object(&a.text());
         let touching = match result {
             Ok(value) => value,
             Err(error) => {
@@ -1435,6 +1633,9 @@ pub(crate) extern "C" fn rt_unary(vm: &mut Vm, op: u32, a: u64) -> u64 {
     vm.program.values.encode(result)
 }
 pub(crate) extern "C" fn rt_state(vm: &mut Vm, field: u32) -> u64 {
+    if field == 13 {
+        return number(vm.sound_states[vm.current.target].volume);
+    }
     if field == 12 {
         return vm
             .program
@@ -1482,6 +1683,47 @@ pub(crate) extern "C" fn rt_state(vm: &mut Vm, field: u32) -> u64 {
 }
 pub(crate) extern "C" fn rt_action(vm: &mut Vm, op: u32, a: u64, b: u64) {
     let value = vm.value(a);
+    if op == 42 || op == 43 {
+        let name = value.text();
+        if let Some((x, y)) = vm.destination(&name) {
+            let target = vm.current.target;
+            if op == 42 {
+                vm.move_to(target, x, y);
+            } else {
+                let sprite = &mut vm.sprites[target];
+                let direction = 90.0 - (y - sprite.y).atan2(x - sprite.x).to_degrees();
+                sprite.direction = (direction + 180.0).rem_euclid(360.0) - 180.0;
+                if sprite.direction == -180.0 {
+                    sprite.direction = 180.0;
+                }
+                vm.publish_sprite(target);
+            }
+        }
+        return;
+    }
+    if op == 44 {
+        let n = vm.program.values.to_number(b);
+        vm.relative_layer(if value.text() == "backward" { -n } else { n });
+        return;
+    }
+    if (36..=41).contains(&op) {
+        if op == 36 {
+            vm.audio.stop();
+            return;
+        }
+        let state = &mut vm.sound_states[vm.current.target];
+        match op {
+            37 => state.volume = value.to_number().clamp(0.0, 100.0),
+            38 => state.volume = (state.volume + value.to_number()).clamp(0.0, 100.0),
+            39 | 40 => state.effect(&value.text(), vm.program.values.to_number(b), op == 40),
+            _ => {
+                state.pitch = 0.0;
+                state.pan = 0.0;
+            }
+        }
+        vm.audio.configure(vm.current.target, *state);
+        return;
+    }
     if op == 33 {
         vm.create_clone(&value.text());
         return;
@@ -1505,7 +1747,7 @@ pub(crate) extern "C" fn rt_action(vm: &mut Vm, op: u32, a: u64, b: u64) {
         let result = if op == 26 {
             vm.stamp()
         } else {
-            vm.play_sound(&value)
+            vm.play_sound(&value).map(|_| ())
         };
         if let Err(error) = result {
             vm.fail(&error.to_string());
@@ -1550,10 +1792,16 @@ pub(crate) extern "C" fn rt_action(vm: &mut Vm, op: u32, a: u64, b: u64) {
             if !costumes.is_empty() {
                 if op == 15 {
                     s.costume = (s.costume + 1) % costumes.len();
-                } else if let Some(id) = costumes.iter().position(|c| c.name == value.text()) {
+                } else if !matches!(value, ScratchValue::Number(_))
+                    && let Some(id) = costumes.iter().position(|c| c.name == value.text())
+                {
                     s.costume = id;
-                } else {
-                    s.costume = ((n.round() - 1.0).rem_euclid(costumes.len() as f64)) as usize;
+                } else if value.text() == "next costume" {
+                    s.costume = (s.costume + 1) % costumes.len();
+                } else if value.text() == "previous costume" {
+                    s.costume = (s.costume + costumes.len() - 1) % costumes.len();
+                } else if vm.program.values.comparison_number(a).is_some() {
+                    s.costume = ((n - 0.5).floor().rem_euclid(costumes.len() as f64)) as usize;
                 }
             }
         }

@@ -1183,6 +1183,118 @@ mod tests {
         Ok(())
     }
     #[test]
+    #[ignore = "requires MSBJIT_DOIRS_PROJECT and a wgpu adapter"]
+    fn doirs_project_renders_and_starts_without_runtime_errors() -> Result<()> {
+        use crate::{
+            input::InputEvent,
+            runtime::{self, RuntimeOptions},
+        };
+        use std::{
+            sync::Arc,
+            thread,
+            time::{Duration, Instant},
+        };
+        let Ok(path) = std::env::var("MSBJIT_DOIRS_PROJECT") else {
+            return Ok(());
+        };
+        let p = Arc::new(Project::load(path)?);
+        let mut renderer = pollster::block_on(Renderer::new(&p))?;
+        let player = p
+            .targets
+            .iter()
+            .position(|t| t.name == "Player")
+            .context("missing player")?;
+        let menu = p
+            .targets
+            .iter()
+            .position(|t| t.name == "main menu")
+            .context("missing menu")?;
+        let running = runtime::spawn_interactive(
+            p.clone(),
+            RuntimeOptions {
+                time_limit: Some(Duration::from_secs(20)),
+                ..Default::default()
+            },
+        )?;
+        let scene = running.scene.clone();
+        scene.input.send(InputEvent::Flag);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while scene
+            .snapshot(&p)
+            .iter()
+            .filter(|s| s.is_clone && s.target == menu && s.active)
+            .count()
+            < 6
+        {
+            if running.is_finished() {
+                running.join()?;
+                anyhow::bail!("game stopped before menu initialized");
+            }
+            ensure!(Instant::now() < deadline, "menu initialization timed out");
+            thread::sleep(Duration::from_millis(10));
+        }
+        thread::sleep(Duration::from_millis(200));
+        let menu_image = renderer.capture_scene(&scene, &scene.snapshot(&p))?;
+        if let Ok(path) = std::env::var("MSBJIT_DOIRS_MENU_CAPTURE") {
+            image::save_buffer(path, &menu_image, WIDTH, HEIGHT, image::ColorType::Rgba8)?;
+        }
+        scene.input.send(InputEvent::Key {
+            key: "space".into(),
+            down: true,
+        });
+        while scene.snapshot(&p)[menu].visible {
+            if running.is_finished() {
+                running.join()?;
+                anyhow::bail!("game stopped while starting");
+            }
+            ensure!(Instant::now() < deadline, "space did not start the game");
+            thread::sleep(Duration::from_millis(10));
+        }
+        scene.input.send(InputEvent::Release);
+        thread::sleep(Duration::from_millis(1500));
+        let before = scene.snapshot(&p)[player].clone();
+        for key in ["right arrow", "up arrow", "left arrow", "down arrow"] {
+            scene.input.send(InputEvent::Key {
+                key: key.into(),
+                down: true,
+            });
+            thread::sleep(Duration::from_millis(400));
+            scene.input.send(InputEvent::Release);
+            let state = scene.snapshot(&p)[player].clone();
+            if (state.x, state.y) != (before.x, before.y) {
+                break;
+            }
+        }
+        let after = scene.snapshot(&p)[player].clone();
+        let image = renderer.capture_scene(&scene, &scene.snapshot(&p))?;
+        if let Ok(path) = std::env::var("MSBJIT_DOIRS_CAPTURE") {
+            image::save_buffer(path, &image, WIDTH, HEIGHT, image::ColorType::Rgba8)?;
+        }
+        assert_ne!(menu_image, image);
+        running.stop();
+        let report = running.join()?;
+        eprintln!(
+            "Input state: {:?}",
+            report
+                .variables
+                .iter()
+                .filter(
+                    |v| ["lpx", "lpy", "controls", "InCloset", "speed"].contains(&v.name.as_str())
+                )
+                .collect::<Vec<_>>()
+        );
+        // This SBText export replaced mouse/motion reporters with constant
+        // zero. Its saved proximity/movement logic traps the player in a closet
+        // after Space starts the game. Synthetic tests cover movement
+        // and alpha collision semantics independently of that export damage.
+        assert!(report.steps > 1000);
+        eprintln!(
+            "Doirs: {} steps, player ({},{}) -> ({},{})",
+            report.steps, before.x, before.y, after.x, after.y
+        );
+        Ok(())
+    }
+    #[test]
     #[ignore = "requires a wgpu graphics adapter"]
     fn native_pen_blocks_render_between_backdrop_and_sprites() -> Result<()> {
         let mut project = Project::load(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/demo.sb3"))?;

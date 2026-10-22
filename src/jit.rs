@@ -69,6 +69,18 @@ impl NativeProgram {
             ),
             ("return", rt_return as *const u8, vec![], Some(types::I32)),
             (
+                "glide_to",
+                rt_glide_to as *const u8,
+                vec![types::F64, types::I64, types::I32],
+                Some(types::I32),
+            ),
+            (
+                "play_until_done",
+                rt_play_until_done as *const u8,
+                vec![types::I64, types::I32],
+                Some(types::I32),
+            ),
+            (
                 "wait",
                 rt_wait as *const u8,
                 vec![types::F64, types::I32],
@@ -363,6 +375,20 @@ impl NativeProgram {
                     Op::DeleteClone => {
                         let deleted = e.call("delete_clone", &[]).unwrap();
                         e.b.ins().brif(deleted, exit, &[], next, &[]);
+                    }
+                    Op::PlayUntilDone(sound) => {
+                        let sound = e.expr(sound);
+                        let pc = e.i32(node.next);
+                        let waiting = e.call("play_until_done", &[sound, pc]).unwrap();
+                        e.b.ins().brif(waiting, exit, &[], next, &[]);
+                    }
+                    Op::GlideTo(seconds, target) => {
+                        let seconds = e.expr(seconds);
+                        let seconds = e.num(seconds);
+                        let target = e.expr(target);
+                        let pc = e.i32(node.next);
+                        let waiting = e.call("glide_to", &[seconds, target, pc]).unwrap();
+                        e.b.ins().brif(waiting, exit, &[], next, &[]);
                     }
                     Op::Broadcast(name, wait) => {
                         let name = e.expr(name);
