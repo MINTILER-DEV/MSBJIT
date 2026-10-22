@@ -11,8 +11,32 @@ const MAX_ASSETS: u64 = 256 * 1024 * 1024;
 #[derive(Debug, Deserialize)]
 pub struct Project {
     pub targets: Vec<Target>,
+    #[serde(default)]
+    pub monitors: Vec<Monitor>,
     #[serde(skip)]
     pub assets: BTreeMap<String, Vec<u8>>,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Monitor {
+    pub id: String,
+    #[serde(default)]
+    pub mode: String,
+    pub opcode: String,
+    #[serde(default)]
+    pub sprite_name: Option<String>,
+    #[serde(default)]
+    pub x: f64,
+    #[serde(default)]
+    pub y: f64,
+    #[serde(default)]
+    pub visible: bool,
+    #[serde(default)]
+    pub slider_min: f64,
+    #[serde(default = "size")]
+    pub slider_max: f64,
+    #[serde(default = "visible")]
+    pub is_discrete: bool,
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

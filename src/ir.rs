@@ -528,6 +528,19 @@ impl Lower<'_> {
         let op = match b.opcode.as_str() {
             "data_setvariableto" => Op::Set(self.var_field(b)?, self.expr_input(b, "VALUE")?),
             "data_changevariableby" => Op::Change(self.var_field(b)?, self.expr_input(b, "VALUE")?),
+            "data_showvariable" | "data_hidevariable" => {
+                let slot = self.var_field(b)?;
+                let slot = self.constant(ScratchValue::Number(slot as f64));
+                Op::Action(
+                    if b.opcode == "data_showvariable" {
+                        28
+                    } else {
+                        29
+                    },
+                    slot,
+                    self.zero(),
+                )
+            }
             "data_addtolist" => Op::List(
                 0,
                 self.list_field(b)?,

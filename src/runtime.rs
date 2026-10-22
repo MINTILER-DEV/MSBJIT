@@ -65,6 +65,7 @@ struct AtomicSprite {
 }
 pub struct SharedScene {
     pub(crate) pen: Mutex<PenCanvas>,
+    pub(crate) monitors: Mutex<Vec<crate::monitors::Monitor>>,
     pub input: InputController,
     sprites: Vec<AtomicSprite>,
     pub stopped: AtomicBool,
@@ -75,6 +76,7 @@ impl SharedScene {
     fn new(project: &Project) -> Self {
         Self {
             pen: Mutex::new(PenCanvas::default()),
+            monitors: Mutex::new(crate::monitors::create(project)),
             input: InputController::default(),
             sprites: project
                 .targets
@@ -315,6 +317,7 @@ pub(crate) struct Vm {
     start: Instant,
     timer: Instant,
     slice_start: Instant,
+    monitor_published: Instant,
     warp_start: Option<Instant>,
     yields: u64,
     ticks: u64,
@@ -370,6 +373,7 @@ impl Vm {
             start: now,
             timer: now,
             slice_start: now,
+            monitor_published: now,
             warp_start: None,
             yields: 0,
             ticks: 0,
@@ -393,11 +397,25 @@ impl Vm {
         a.rotation
             .store(rotation_id(&s.rotation_style), Ordering::Relaxed);
     }
-    fn publish(&self) {
+    fn publish(&mut self) {
         for id in 0..self.sprites.len() {
             self.publish_sprite(id);
         }
         self.shared.steps.store(self.jit.steps, Ordering::Relaxed);
+        if self.monitor_published.elapsed() >= Duration::from_millis(16) {
+            self.publish_monitors();
+        }
+    }
+    fn publish_monitors(&mut self) {
+        let mut monitors = self
+            .shared
+            .monitors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for m in monitors.iter_mut().filter(|m| m.visible) {
+            m.update(self.program.values.decode(self.vars[m.slot]));
+        }
+        self.monitor_published = Instant::now();
     }
     fn run(&mut self, native: &NativeProgram) -> Result<RunReport> {
         let mut fibers: Vec<Fiber> = self
@@ -414,6 +432,11 @@ impl Vm {
         while (!fibers.is_empty() || self.interactive)
             && !self.shared.stopped.load(Ordering::Relaxed)
         {
+            // Keep monitors fresh after the last script finishes as well as
+            // during execution; an interactive player can remain idle here.
+            if self.monitor_published.elapsed() >= Duration::from_millis(16) {
+                self.publish_monitors();
+            }
             if self.limit_reached() {
                 self.shared.stopped.store(true, Ordering::Relaxed);
                 break;
@@ -421,6 +444,20 @@ impl Vm {
             let (input, events) = self.shared.input.drain();
             self.input = input;
             for event in events {
+                if let InputEvent::MonitorSlider { slot, value } = event {
+                    let mut monitors = self
+                        .shared
+                        .monitors
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if let Some(m) = monitors.iter_mut().find(|m| m.slot == slot)
+                        && let Some(value) = m.slider_value(value)
+                    {
+                        self.vars[slot] = number(value);
+                        m.update(ScratchValue::Number(value));
+                    }
+                    continue;
+                }
                 if matches!(event, InputEvent::Stop | InputEvent::Flag) {
                     fibers.clear();
                     self.audio.stop();
@@ -594,6 +631,7 @@ impl Vm {
             }
         }
         self.publish();
+        self.publish_monitors();
         Ok(RunReport {
             steps: self.jit.steps,
             yields: self.yields,
@@ -1100,6 +1138,17 @@ pub(crate) extern "C" fn rt_state(vm: &mut Vm, field: u32) -> u64 {
 }
 pub(crate) extern "C" fn rt_action(vm: &mut Vm, op: u32, a: u64, b: u64) {
     let value = vm.value(a);
+    if op == 28 || op == 29 {
+        let slot = value.to_number() as usize;
+        let mut monitors = vm.shared.monitors.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = monitors.iter_mut().find(|m| m.slot == slot) {
+            m.visible = op == 28;
+            if m.visible {
+                m.update(vm.program.values.decode(vm.vars[slot]));
+            }
+        }
+        return;
+    }
     if op == 26 || op == 27 {
         let result = if op == 26 {
             vm.stamp()

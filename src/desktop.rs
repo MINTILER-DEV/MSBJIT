@@ -37,6 +37,7 @@ pub fn show(
     toolbar(&mut buffer);
     let mut held = HashSet::new();
     let mut mouse_down = false;
+    let mut monitor_pointer = crate::monitors::display::Pointer::default();
     let mut last_mouse = (0.0, 0.0);
     let start = Instant::now();
     while window.is_open()
@@ -56,6 +57,7 @@ pub fn show(
             scene.input.send(InputEvent::Release);
             held.clear();
             mouse_down = false;
+            monitor_pointer.release();
             continue;
         }
         let keys: HashSet<String> = window.get_keys().into_iter().filter_map(key_name).collect();
@@ -79,6 +81,7 @@ pub fn show(
             .and_then(|(x, y)| buffer_point(window.get_size(), x as f64, y as f64));
         if let Some((x, y)) = point {
             if y < TOOLBAR as f64 {
+                monitor_pointer.release();
                 scene.input.send(InputEvent::Mouse {
                     x: x - 240.0,
                     y: 180.0,
@@ -93,12 +96,21 @@ pub fn show(
             } else {
                 let (x, y) = (x - 240.0, 180.0 - (y - TOOLBAR as f64));
                 last_mouse = (x, y);
-                scene.input.send(InputEvent::Mouse { x, y, down });
-                if pressed && let Some(target) = renderer.hit_test(&states, x, y) {
+                let consumed = monitor_pointer.update(&scene, x, y, down);
+                scene.input.send(InputEvent::Mouse {
+                    x,
+                    y,
+                    down: down && !consumed,
+                });
+                if pressed
+                    && !consumed
+                    && let Some(target) = renderer.hit_test(&states, x, y)
+                {
                     scene.input.send(InputEvent::Click { target });
                 }
             }
         } else {
+            monitor_pointer.release();
             // Clear a held button when the pointer leaves the stage/window.
             scene.input.send(InputEvent::Mouse {
                 x: last_mouse.0,

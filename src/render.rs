@@ -33,6 +33,7 @@ pub(crate) struct Renderer {
     pen_texture: wgpu::Texture,
     pen_bind: wgpu::BindGroup,
     pen_generation: u64,
+    monitors: crate::monitors::display::Overlay,
 }
 impl Renderer {
     pub async fn new(project: &Project) -> Result<Self> {
@@ -284,6 +285,7 @@ impl Renderer {
             pen_texture,
             pen_bind,
             pen_generation: u64::MAX,
+            monitors: Default::default(),
         })
     }
     /// Pick the frontmost visible, nontransparent costume pixel. Transform the
@@ -365,7 +367,9 @@ impl Renderer {
             );
             self.pen_generation = generation;
         }
-        self.capture(states)
+        let mut rgba = self.capture(states)?;
+        self.monitors.composite(scene, &mut rgba);
+        Ok(rgba)
     }
     fn capture(&mut self, states: &[SpriteState]) -> Result<Vec<u8>> {
         let mut vertices = Vec::with_capacity((states.len() + 1) * 6);
@@ -536,6 +540,36 @@ pub(crate) fn decode(name: &str, data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires a wgpu graphics adapter"]
+    fn variable_monitors_composite_above_the_gpu_stage() -> Result<()> {
+        let mut project = Project::load(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/demo.sb3"))?;
+        for t in &mut project.targets {
+            t.blocks.clear();
+        }
+        let stage = project.targets.iter_mut().find(|t| t.is_stage).unwrap();
+        stage.variables.insert(
+            "monitor".into(),
+            ("score".into(), crate::value::ScratchValue::Number(42.0)),
+        );
+        project.monitors = serde_json::from_value(serde_json::json!([
+            {"id":"monitor","opcode":"data_variable","mode":"large","x":10,"y":10,"visible":true}
+        ]))?;
+        let project = std::sync::Arc::new(project);
+        let run = crate::runtime::spawn(project.clone(), Default::default())?;
+        let scene = run.scene.clone();
+        let report = run.join()?;
+        let mut renderer = pollster::block_on(Renderer::new(&project))?;
+        let baseline = renderer.capture(&report.sprites)?;
+        let frame = renderer.capture_scene(&scene, &report.sprites)?;
+        assert_eq!(&frame[(15 * 480 + 15) * 4..][..4], &[255, 140, 26, 255]);
+        for m in scene.monitors.lock().unwrap().iter_mut() {
+            m.visible = false;
+        }
+        let hidden = renderer.capture_scene(&scene, &report.sprites)?;
+        assert_eq!(hidden, baseline);
+        Ok(())
+    }
     #[test]
     fn zero_sized_svg_costumes_are_transparent_but_malformed_svgs_fail() -> Result<()> {
         let (w, h, rgba) = decode(

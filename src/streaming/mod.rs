@@ -208,6 +208,7 @@ async fn session(socket: WebSocket, state: ServerState) -> Result<()> {
     let (mut output, mut input) = socket.split();
     let mut shutdown = state.shutdown;
     let mut mouse_down = false;
+    let mut monitor_pointer = crate::monitors::display::Pointer::default();
     let result = async {
         loop {
             let message = tokio::select! {
@@ -226,15 +227,26 @@ async fn session(socket: WebSocket, state: ServerState) -> Result<()> {
                                 serde_json::from_value(message["event"].clone())?;
                             match event {
                                 InputEvent::Mouse { x, y, down } => {
-                                    if down && !mouse_down && x.is_finite() && y.is_finite() {
+                                    let consumed = monitor_pointer.update(&state.scene, x, y, down);
+                                    if down
+                                        && !mouse_down
+                                        && !consumed
+                                        && x.is_finite()
+                                        && y.is_finite()
+                                    {
                                         let _ = state.clicks.try_send((x, y));
                                     }
                                     mouse_down = down;
-                                    state.scene.input.send(InputEvent::Mouse { x, y, down });
+                                    state.scene.input.send(InputEvent::Mouse {
+                                        x,
+                                        y,
+                                        down: down && !consumed,
+                                    });
                                 }
                                 InputEvent::Click { .. } => {} // Hit targets are selected by the host.
                                 InputEvent::Release => {
                                     mouse_down = false;
+                                    monitor_pointer.release();
                                     state.scene.input.send(InputEvent::Release);
                                 }
                                 event => state.scene.input.send(event),

@@ -5,6 +5,7 @@ pub mod input;
 mod ir;
 mod jit;
 mod lists;
+mod monitors;
 mod pen;
 pub mod project;
 #[cfg(feature = "graphics")]

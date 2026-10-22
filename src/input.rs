@@ -8,9 +8,24 @@ use std::{
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InputEvent {
-    Key { key: String, down: bool },
-    Mouse { x: f64, y: f64, down: bool },
-    Click { target: usize },
+    Key {
+        key: String,
+        down: bool,
+    },
+    Mouse {
+        x: f64,
+        y: f64,
+        down: bool,
+    },
+    Click {
+        target: usize,
+    },
+    // Host-selected slider binding, never accepted directly from a browser.
+    #[serde(skip)]
+    MonitorSlider {
+        slot: usize,
+        value: f64,
+    },
     Flag,
     Stop,
     Release,
@@ -90,6 +105,15 @@ impl InputController {
             }
             InputEvent::Flag | InputEvent::Stop => {
                 pending.events.clear();
+                event
+            }
+            InputEvent::MonitorSlider { slot, value } => {
+                if !value.is_finite() {
+                    return;
+                }
+                pending.events.retain(
+                    |e| !matches!(e, InputEvent::MonitorSlider { slot: old, .. } if *old == slot),
+                );
                 event
             }
             _ => event,
