@@ -11,10 +11,24 @@ use msbjit::{
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a wgpu adapter and FFmpeg with libx264"]
 async fn browser_input_reaches_native_scripts_over_websocket() -> Result<()> {
-    let project = Arc::new(Project::load(concat!(
+    let mut project = Project::load(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/examples/interactive.sb3"
-    ))?);
+    ))?;
+    project.targets[0].variables.insert(
+        "slider".into(),
+        ("slider".into(), msbjit::value::ScratchValue::Number(0.0)),
+    );
+    project.monitors = serde_json::from_value(serde_json::json!([
+        {"id":"slider","opcode":"data_variable","mode":"slider","x":10,"y":10,"visible":true,"sliderMin":0,"sliderMax":100}
+    ]))?;
+    project.targets[0].blocks = serde_json::from_value(serde_json::json!({
+        "key":{"opcode":"event_whenkeypressed","topLevel":true,"fields":{"KEY_OPTION":["s"]},"next":"read"},
+        "read":{"opcode":"motion_setx","inputs":{"X":[3,[12,"slider","slider"],[4,"0"]]}},
+        "click":{"opcode":"event_whenstageclicked","topLevel":true,"next":"clicked"},
+        "clicked":{"opcode":"motion_sety","inputs":{"Y":[1,[4,"99"]]}}
+    }))?;
+    let project = Arc::new(project);
     let running = runtime::spawn_interactive(project.clone(), RuntimeOptions::default())?;
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
@@ -58,6 +72,23 @@ async fn browser_input_reaches_native_scripts_over_websocket() -> Result<()> {
             ensure!(tokio::time::Instant::now() < deadline, "WebSocket flag did not restart sprite");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        // Pointer coordinates cross the same host monitor hit testing used by
+        // desktop input. Drag past the track, then read the actual JIT variable.
+        for event in [
+            serde_json::json!({"type":"release"}),
+            serde_json::json!({"type":"mouse","x":-190,"y":139,"down":true}),
+            serde_json::json!({"type":"mouse","x":1000,"y":139,"down":true}),
+            serde_json::json!({"type":"mouse","x":1000,"y":139,"down":false}),
+            serde_json::json!({"type":"key","key":"s","down":true})
+        ] {
+            let message = serde_json::json!({"type":"input","event":event});
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(message.to_string().into())).await?;
+        }
+        while running.scene.snapshot(&project)[0].x != 100.0 {
+            ensure!(tokio::time::Instant::now() < deadline, "WebSocket slider did not update JIT variable");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        ensure!(running.scene.snapshot(&project)[0].y == 0.0, "slider click leaked through to stage hat");
         ws.close(None).await?;
         Ok::<_, anyhow::Error>(())
     }.await;
