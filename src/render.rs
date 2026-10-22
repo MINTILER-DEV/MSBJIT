@@ -1,4 +1,5 @@
 use crate::{
+    pen::{PenCommand, PenLine},
     project::Project,
     runtime::{SharedScene, SpriteState},
 };
@@ -67,6 +68,10 @@ pub(crate) struct Renderer {
     pen_texture: wgpu::Texture,
     pen_bind: wgpu::BindGroup,
     pen_generation: u64,
+    pen_pipeline: wgpu::RenderPipeline,
+    pen_overlay_layout: wgpu::BindGroupLayout,
+    pen_sampler: wgpu::Sampler,
+    pen_quad: wgpu::Buffer,
     monitors: crate::monitors::display::Overlay,
 }
 fn draw_order(states: &[SpriteState]) -> Vec<usize> {
@@ -183,6 +188,55 @@ impl Renderer {
             ..Default::default()
         });
         let nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
+        let pen_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Pen capsule shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("pen.wgsl").into()),
+        });
+        let pen_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Instanced pen strokes"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &pen_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<PenLine>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![0=>Float32x4,1=>Float32x4,2=>Float32],
+                }],
+            },
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &pen_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview: None,
+            cache: None,
+        });
+        let quad: Vec<_> = [[0., 0.], [1., 0.], [0., 1.], [0., 1.], [1., 0.], [1., 1.]]
+            .into_iter()
+            .map(|[u, v]| Vertex {
+                position: [u * 2. - 1., 1. - v * 2.],
+                uv: [u, v],
+                shape: [0., 1., 0., 0.],
+                color: [1., 0., 1., 0.],
+                skin_size: [480., 360.],
+                effect_mask: 0,
+            })
+            .collect();
+        let pen_quad = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Pen stamp quad"),
+            contents: bytemuck::cast_slice(&quad),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
         let pen_texture = device.create_texture_with_data(
             &queue,
             &wgpu::TextureDescriptor {
@@ -196,7 +250,9 @@ impl Renderer {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
                 view_formats: &[],
             },
             wgpu::util::TextureDataOrder::LayerMajor,
@@ -339,6 +395,10 @@ impl Renderer {
             pen_texture,
             pen_bind,
             pen_generation: u64::MAX,
+            pen_pipeline,
+            pen_overlay_layout: layout,
+            pen_sampler: nearest_sampler,
+            pen_quad,
             monitors: Default::default(),
         })
     }
@@ -398,10 +458,11 @@ impl Renderer {
         scene: &SharedScene,
         states: &[SpriteState],
     ) -> Result<Vec<u8>> {
-        let update = {
-            let layer = scene.pen.lock().unwrap_or_else(|e| e.into_inner());
-            (layer.generation != self.pen_generation)
-                .then(|| (layer.generation, layer.pixels.clone()))
+        let (update, commands) = {
+            let mut layer = scene.pen.lock().unwrap_or_else(|e| e.into_inner());
+            let update = (!layer.deferred && layer.generation != self.pen_generation)
+                .then(|| (layer.generation, layer.pixels.clone()));
+            (update, layer.take_commands())
         };
         if let Some((generation, mut pixels)) = update {
             pixels.resize((WIDTH * HEIGHT * 4) as usize, 0);
@@ -426,10 +487,126 @@ impl Renderer {
             );
             self.pen_generation = generation;
         }
+        self.draw_pen(commands);
         let mut rgba = self.capture(states)?;
         self.monitors.composite(scene, &mut rgba);
         crate::monitors::display::question_overlay(scene, &mut rgba);
         Ok(rgba)
+    }
+    fn draw_pen(&self, commands: Vec<PenCommand>) {
+        if commands.is_empty() {
+            return;
+        }
+        let lines: Vec<_> = commands
+            .iter()
+            .filter_map(|c| match c {
+                PenCommand::Line(line) => Some(*line),
+                _ => None,
+            })
+            .collect();
+        let instances = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Pen stroke instances"),
+                contents: bytemuck::cast_slice(&lines),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let view = self.pen_texture.create_view(&Default::default());
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        let mut cursor = 0;
+        let mut line_index = 0;
+        while cursor < commands.len() {
+            let clear = matches!(commands[cursor], PenCommand::Clear);
+            if clear {
+                cursor += 1;
+            }
+            let first = line_index;
+            while cursor < commands.len() && matches!(commands[cursor], PenCommand::Line(_)) {
+                cursor += 1;
+                line_index += 1;
+            }
+            if clear || first != line_index {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Pen strokes"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: if clear {
+                                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+                            } else {
+                                wgpu::LoadOp::Load
+                            },
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                if first != line_index {
+                    pass.set_pipeline(&self.pen_pipeline);
+                    pass.set_vertex_buffer(0, instances.slice(..));
+                    pass.draw(0..6, first..line_index);
+                }
+            }
+            if let Some(PenCommand::Image(pixels)) = commands.get(cursor) {
+                let texture = self.device.create_texture_with_data(
+                    &self.queue,
+                    &wgpu::TextureDescriptor {
+                        label: Some("Pen stamp overlay"),
+                        size: wgpu::Extent3d {
+                            width: WIDTH,
+                            height: HEIGHT,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    },
+                    wgpu::util::TextureDataOrder::LayerMajor,
+                    pixels,
+                );
+                let stamp_view = texture.create_view(&Default::default());
+                let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Pen stamp overlay"),
+                    layout: &self.pen_overlay_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&stamp_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&self.pen_sampler),
+                        },
+                    ],
+                });
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Pen stamp"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&self.pipeline);
+                pass.set_vertex_buffer(0, self.pen_quad.slice(..));
+                pass.set_bind_group(0, &bind, &[]);
+                pass.draw(0..6, 0..1);
+                cursor += 1;
+            }
+        }
+        self.queue.submit(Some(encoder.finish()));
     }
     fn capture(&mut self, states: &[SpriteState]) -> Result<Vec<u8>> {
         let mut vertices = Vec::with_capacity((states.len() + 1) * 6);
@@ -652,6 +829,157 @@ pub(crate) fn decode(name: &str, data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires a wgpu adapter"]
+    fn gpu_pen_matches_cpu_capsules_and_stamp_order() -> Result<()> {
+        use crate::{
+            pen::{PenCanvas, PenState},
+            runtime::{self, RuntimeOptions},
+            value::ScratchValue,
+        };
+        let project = std::sync::Arc::new(serde_json::from_value::<Project>(
+            serde_json::json!({"targets":[{"name":"Stage","isStage":true}]}),
+        )?);
+        let running = runtime::spawn(project.clone(), RuntimeOptions::default())?;
+        let scene = running.scene.clone();
+        let report = running.join()?;
+        let mut renderer = pollster::block_on(Renderer::new(&project))?;
+        let mut cpu = PenCanvas::default();
+        let mut gpu = PenCanvas::default();
+        gpu.enable_gpu();
+        let mut pen = PenState::default();
+        for (size, color, transparency, from, to) in [
+            (12., "#ff0000", 0., (-220., -140.), (190., 125.)),
+            (6., "#00ff00", 50., (-180., 140.), (160., -120.)),
+            (37., "#0000ff", 25., (0., 0.), (0., 0.)),
+            (1., "#000000", 0., (-230., 70.), (220., 70.)),
+            (3., "#ff00ff", 0., (-10000., -20.), (10000., -20.)),
+            (1200., "#ffaa00", 90., (-250., -190.), (-250., -190.)),
+        ] {
+            pen.size = size;
+            pen.set_color(&ScratchValue::String(color.into()));
+            pen.parameter("transparency", transparency, false);
+            cpu.line(&pen, from, to);
+            gpu.line(&pen, from, to);
+        }
+        cpu.publish_to(&mut scene.pen.lock().unwrap());
+        let reference = renderer.capture_scene(&scene, &report.sprites)?;
+        gpu.publish_to(&mut scene.pen.lock().unwrap());
+        let actual = renderer.capture_scene(&scene, &report.sprites)?;
+        let max_error = reference
+            .iter()
+            .zip(&actual)
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap();
+        assert!(max_error <= 3, "CPU/GPU capsule error: {max_error}");
+        let mut stamp = vec![0; (WIDTH * HEIGHT * 4) as usize];
+        let center = (180 * WIDTH as usize + 240) * 4;
+        stamp[center..center + 4].copy_from_slice(&[128, 0, 0, 128]);
+        gpu.clear();
+        gpu.stamp_image(stamp);
+        gpu.publish_to(&mut scene.pen.lock().unwrap());
+        let stamped = renderer.capture_scene(&scene, &report.sprites)?;
+        assert_eq!(&stamped[center..center + 4], &[255, 127, 127, 255]);
+        assert_eq!(&stamped[..4], &[255; 4]);
+        gpu.clear();
+        gpu.publish_to(&mut scene.pen.lock().unwrap());
+        assert!(
+            renderer
+                .capture_scene(&scene, &report.sprites)?
+                .iter()
+                .all(|v| *v == 255)
+        );
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires MSBJIT_PEN_BENCH_PROJECT and a wgpu adapter; use release mode"]
+    fn sub1k_complete_frames() -> Result<()> {
+        use crate::{
+            runtime::{self, RuntimeOptions},
+            value::ScratchValue,
+        };
+        use std::{
+            sync::Arc,
+            time::{Duration, Instant},
+        };
+        let path = std::env::var("MSBJIT_PEN_BENCH_PROJECT")?;
+        let project = Arc::new(Project::load(path)?);
+        let expected: u32 = std::env::var("MSBJIT_PEN_BENCH_FRAMES")
+            .unwrap_or("30".into())
+            .parse()?;
+        let mut renderer = pollster::block_on(Renderer::new(&project))?;
+        let mut samples = Vec::new();
+        let mut reference = None;
+        for pass in 0..6 {
+            let gpu = if pass % 4 < 2 {
+                pass % 2 == 1
+            } else {
+                pass % 2 == 0
+            };
+            let running = runtime::spawn(
+                project.clone(),
+                RuntimeOptions {
+                    turbo: true,
+                    time_limit: Some(Duration::from_secs(120)),
+                    ..Default::default()
+                },
+            )?;
+            let scene = running.scene.clone();
+            if gpu {
+                scene.enable_gpu_pen();
+            }
+            let start = Instant::now();
+            while !running.is_finished() {
+                renderer.capture_scene(&scene, &scene.snapshot(&project))?;
+                std::thread::sleep(Duration::from_millis(8));
+                ensure!(
+                    start.elapsed() < Duration::from_secs(180),
+                    "benchmark timed out"
+                );
+            }
+            let report = running.join()?;
+            ensure!(!report.interrupted, "benchmark did not finish");
+            let frames = report
+                .variables
+                .iter()
+                .find(|v| v.name == "System: Frames Elapsed")
+                .context("frame counter missing")?;
+            ensure!(
+                frames.value == ScratchValue::Number(expected as f64 + 1.),
+                "incorrect frame count: {:?}",
+                frames.value
+            );
+            renderer.capture_scene(&scene, &report.sprites)?;
+            // FPS/timer monitor text varies with execution speed; compare all
+            // stage drawing without that separate UI overlay.
+            let image = renderer.capture(&report.sprites)?;
+            if let Some(reference) = &reference {
+                let total: u64 = image
+                    .iter()
+                    .zip(reference)
+                    .map(|(a, b): (&u8, &u8)| a.abs_diff(*b) as u64)
+                    .sum();
+                ensure!(
+                    total < image.len() as u64,
+                    "final rendered frame differs excessively: {total}"
+                );
+            } else {
+                reference = Some(image.clone());
+            }
+            if let Ok(path) = std::env::var("MSBJIT_PEN_BENCH_CAPTURE") {
+                image::save_buffer(path, &image, WIDTH, HEIGHT, image::ColorType::Rgba8)?;
+            }
+            let sample = serde_json::json!({"gpu":gpu,"elapsed":report.elapsed_seconds,"frames":expected,
+                "fps": expected as f64 / report.elapsed_seconds, "steps":report.steps});
+            eprintln!("{sample}");
+            samples.push(sample);
+        }
+        if let Ok(path) = std::env::var("MSBJIT_PEN_BENCH_OUTPUT") {
+            std::fs::write(path, serde_json::to_vec_pretty(&samples)?)?;
+        }
+        Ok(())
+    }
     #[test]
     fn svg_text_uses_bundled_fonts_and_scratch_marker_alias() -> Result<()> {
         let svg = |family| {

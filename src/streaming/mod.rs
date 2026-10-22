@@ -69,6 +69,7 @@ pub async fn serve(
         .context("bind local signaling server")?;
     let address = listener.local_addr()?;
     let mut renderer = render::Renderer::new(&project).await?;
+    scene.enable_gpu_pen();
     let mut encoder =
         encoder::Encoder::start(&options.encoder, options.fps, &options.vaapi_device)?;
     let (shutdown, shutdown_rx) = watch::channel(false);

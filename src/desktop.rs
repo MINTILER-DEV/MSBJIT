@@ -48,6 +48,7 @@ pub fn show(
     let mut question_id = None;
     let mut draft = String::new();
     let mut renderer = pollster::block_on(Renderer::new(project))?;
+    scene.enable_gpu_pen();
     scene.input.send(InputEvent::Flag);
     let mut buffer = vec![0x1f2937; WIDTH * HEIGHT];
     toolbar(&mut buffer);

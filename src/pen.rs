@@ -2,6 +2,7 @@
 use crate::value::ScratchValue;
 pub(crate) const WIDTH: usize = 480;
 pub(crate) const HEIGHT: usize = 360;
+pub(crate) const MAX_QUEUED_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct PenState {
@@ -90,14 +91,75 @@ impl PenState {
     }
 }
 
+/// One instance for the GPU capsule shader, in stage pixels and straight RGBA.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "graphics", derive(bytemuck::Pod, bytemuck::Zeroable))]
+#[cfg_attr(not(feature = "graphics"), allow(dead_code))]
+pub(crate) struct PenLine {
+    pub endpoints: [f32; 4],
+    pub color: [f32; 4],
+    pub radius: f32,
+}
+#[cfg_attr(not(feature = "graphics"), allow(dead_code))]
+pub(crate) enum PenCommand {
+    Clear,
+    Line(PenLine),
+    /// A premultiplied full-stage stamp, composited over previous strokes.
+    Image(Vec<u8>),
+}
+
 #[derive(Default)]
 pub(crate) struct PenCanvas {
     pub pixels: Vec<u8>,
     pub generation: u64,
+    pub commands: Vec<PenCommand>,
+    pub deferred: bool,
+    pub queued_bytes: usize,
 }
 impl PenCanvas {
+    pub fn enable_gpu(&mut self) {
+        if !self.deferred {
+            self.deferred = true;
+            self.commands.push(PenCommand::Clear);
+            if !self.pixels.is_empty() {
+                let pixels = std::mem::take(&mut self.pixels);
+                self.stamp_image(pixels);
+            }
+        }
+    }
+    /// The display never reads the VM's working layer during erase/rebuild.
+    pub fn publish_to(&mut self, published: &mut Self) {
+        if self.deferred {
+            if let Some(last_clear) = self
+                .commands
+                .iter()
+                .rposition(|c| matches!(c, PenCommand::Clear))
+            {
+                published.commands.clear();
+                published.queued_bytes = 0;
+                self.commands.drain(..last_clear);
+            }
+            published.commands.append(&mut self.commands);
+            published.queued_bytes += std::mem::take(&mut self.queued_bytes);
+            published.deferred = true;
+        } else if published.generation != self.generation {
+            published.pixels.clone_from(&self.pixels);
+        }
+        published.generation = self.generation;
+    }
+    pub fn stamp_image(&mut self, pixels: Vec<u8>) {
+        self.queued_bytes += pixels.len();
+        self.commands.push(PenCommand::Image(pixels));
+        self.generation = self.generation.wrapping_add(1);
+    }
     pub fn clear(&mut self) {
         self.pixels.clear();
+        if self.deferred {
+            self.commands.clear();
+            self.queued_bytes = 0;
+            self.commands.push(PenCommand::Clear);
+        }
         self.generation = self.generation.wrapping_add(1);
     }
     pub fn line(&mut self, pen: &PenState, from: (f64, f64), to: (f64, f64)) {
@@ -120,8 +182,18 @@ impl PenCanvas {
         if left >= right || top >= bottom || !length.is_finite() {
             return;
         }
-        self.pixels.resize(WIDTH * HEIGHT * 4, 0);
         let color = pen.rgba();
+        if self.deferred {
+            self.queued_bytes += std::mem::size_of::<PenLine>();
+            self.commands.push(PenCommand::Line(PenLine {
+                endpoints: [ax as f32, ay as f32, bx as f32, by as f32],
+                color: color.map(|c| c as f32),
+                radius: radius as f32,
+            }));
+            self.generation = self.generation.wrapping_add(1);
+            return;
+        }
+        self.pixels.resize(WIDTH * HEIGHT * 4, 0);
         for y in top..bottom {
             for x in left..right {
                 let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
@@ -146,11 +218,40 @@ impl PenCanvas {
         }
         self.generation = self.generation.wrapping_add(1);
     }
+    #[cfg(feature = "graphics")]
+    pub fn take_commands(&mut self) -> Vec<PenCommand> {
+        self.queued_bytes = 0;
+        std::mem::take(&mut self.commands)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unpublished_erase_cannot_replace_a_completed_frame() {
+        let mut working = PenCanvas::default();
+        working.enable_gpu();
+        let pen = PenState::default();
+        working.line(&pen, (0., 0.), (50., 50.));
+        let mut displayed = PenCanvas::default();
+        working.publish_to(&mut displayed);
+        assert_eq!(displayed.commands.len(), 2);
+        working.clear();
+        assert_eq!(displayed.commands.len(), 2);
+        working.line(&pen, (50., 50.), (100., 100.));
+        working.publish_to(&mut displayed);
+        assert_eq!(
+            displayed.commands.len(),
+            2,
+            "obsolete frames must be discarded at clear"
+        );
+        assert!(matches!(displayed.commands[0], PenCommand::Clear));
+        let PenCommand::Line(line) = displayed.commands[1] else {
+            panic!("missing new stroke")
+        };
+        assert_eq!(line.endpoints, [290., 130., 340., 80.]);
+    }
     #[test]
     fn pen_draws_persistent_clipped_color_and_clear() {
         let mut canvas = PenCanvas::default();

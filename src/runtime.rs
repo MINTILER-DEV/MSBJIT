@@ -4,7 +4,7 @@ use crate::{
     ir::{Hat, Program},
     jit::NativeProgram,
     lists::{ListView, RuntimeList},
-    pen::{PenCanvas, PenState},
+    pen::{MAX_QUEUED_BYTES, PenCanvas, PenState},
     project::Project,
     sprite_cpu::CostumePixels,
     value::{ScratchValue, number},
@@ -88,6 +88,7 @@ pub struct QuestionPrompt {
 pub struct SharedScene {
     pub question: Mutex<Option<QuestionPrompt>>,
     pub(crate) pen: Mutex<PenCanvas>,
+    gpu_pen: AtomicBool,
     pub(crate) monitors: Mutex<Vec<crate::monitors::Monitor>>,
     pub input: InputController,
     sprites: Vec<AtomicSprite>,
@@ -101,6 +102,7 @@ impl SharedScene {
         Self {
             question: Mutex::new(None),
             pen: Mutex::new(PenCanvas::default()),
+            gpu_pen: AtomicBool::new(false),
             monitors: Mutex::new(crate::monitors::create(project)),
             input: InputController::default(),
             clones: Mutex::new(Vec::new()),
@@ -123,6 +125,11 @@ impl SharedScene {
             steps: AtomicU64::new(0),
             finished: AtomicBool::new(false),
         }
+    }
+    /// Enable command-based pen rendering before sending the initial flag.
+    #[cfg(feature = "graphics")]
+    pub(crate) fn enable_gpu_pen(&self) {
+        self.gpu_pen.store(true, Ordering::Release);
     }
     pub fn snapshot(&self, project: &Project) -> Vec<SpriteState> {
         let mut states: Vec<_> = self
@@ -371,6 +378,7 @@ pub(crate) struct Vm {
     clones: Vec<Option<CloneData>>,
     next_sprite_id: usize,
     pens: Vec<PenState>,
+    pen: PenCanvas,
     audio: AudioPlayer,
     sound_states: Vec<SoundState>,
     questions: VecDeque<QuestionPrompt>,
@@ -434,6 +442,7 @@ impl Vm {
             clones: Vec::new(),
             next_sprite_id: project.targets.len(),
             pens: vec![PenState::default(); project.targets.len()],
+            pen: PenCanvas::default(),
             audio: AudioPlayer::default(),
             questions: VecDeque::new(),
             next_question: 0,
@@ -620,11 +629,7 @@ impl Vm {
         self.sprites[target].x = x;
         self.sprites[target].y = y;
         if self.pens[target].down {
-            self.shared
-                .pen
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .line(&self.pens[target], old, (x, y));
+            self.pen.line(&self.pens[target], old, (x, y));
         }
         self.publish_sprite(target);
     }
@@ -784,10 +789,14 @@ impl Vm {
         let mut next_id = fibers.len() as u64 + 1;
         let tick = Duration::from_secs_f64(1.0 / self.options.tick_hz);
         let mut tick_deadline = Instant::now();
+        let mut pen_published = Instant::now();
         while (!fibers.is_empty() || self.interactive)
             && !self.shared.stopped.load(Ordering::Relaxed)
         {
             self.audio.tick();
+            if self.shared.gpu_pen.load(Ordering::Acquire) {
+                self.pen.enable_gpu();
+            }
             // Keep monitors fresh after the last script finishes as well as
             // during execution; an interactive player can remain idle here.
             if self.monitor_published.elapsed() >= Duration::from_millis(16) {
@@ -1048,6 +1057,39 @@ impl Vm {
                 .retain(|q| fibers.iter().any(|f| f.ask_wait == Some(q.id)));
             self.publish_question();
             refresh_waiters(&mut fibers);
+            // Host checkpoints in an uninterrupted warp block are not Scratch
+            // redraw boundaries. Include broadcast receivers in the same round
+            // so erase and render scripts reach the display together.
+            let unfinished_warp = fibers.iter().any(|f| {
+                f.warp()
+                    && f.waiting.is_empty()
+                    && f.wake.is_none()
+                    && f.sound_wait.is_none()
+                    && f.ask_wait.is_none()
+            });
+            if !unfinished_warp
+                || pen_published.elapsed() >= Duration::from_millis(500)
+                || self.pen.queued_bytes >= MAX_QUEUED_BYTES
+            {
+                self.pen
+                    .publish_to(&mut self.shared.pen.lock().unwrap_or_else(|e| e.into_inner()));
+                pen_published = Instant::now();
+                // A slow/paused consumer cannot grow a persistent command queue
+                // without bound. Clears replace obsolete frames; otherwise
+                // apply backpressure while still honoring stop and time limits.
+                while self
+                    .shared
+                    .pen
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .queued_bytes
+                    >= MAX_QUEUED_BYTES
+                    && !self.shared.stopped.load(Ordering::Relaxed)
+                    && !self.limit_reached()
+                {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
             let roots =
                 self.program
                     .constants
@@ -1197,8 +1239,15 @@ impl Vm {
     }
     fn stamp(&mut self) -> Result<()> {
         if let Some(pixels) = self.costume_pixels(self.current.target)? {
-            let mut pen = self.shared.pen.lock().unwrap_or_else(|e| e.into_inner());
-            pixels.stamp(&self.sprites[self.current.target], &mut pen);
+            if self.pen.deferred {
+                let mut stamp = PenCanvas::default();
+                pixels.stamp(&self.sprites[self.current.target], &mut stamp);
+                if !stamp.pixels.is_empty() {
+                    self.pen.stamp_image(stamp.pixels);
+                }
+            } else {
+                pixels.stamp(&self.sprites[self.current.target], &mut self.pen);
+            }
         }
         Ok(())
     }
@@ -1308,6 +1357,9 @@ pub(crate) extern "C" fn rt_checkpoint(vm: &mut Vm, pc: u32) -> u32 {
         return 1;
     }
     let now = Instant::now();
+    if vm.pen.queued_bytes >= MAX_QUEUED_BYTES {
+        return 1;
+    }
     if vm.current.warp() {
         let start = *vm.warp_start.get_or_insert(now);
         if now.duration_since(start) >= vm.options.warp_timeout {
@@ -1898,21 +1950,12 @@ pub(crate) extern "C" fn rt_action(vm: &mut Vm, op: u32, a: u64, b: u64) {
         }
         16 => vm.timer = Instant::now(),
         17 => s.rotation_style = value.text(),
-        18 => vm
-            .shared
-            .pen
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear(),
+        18 => vm.pen.clear(),
         19 => {
             let pen = &mut vm.pens[target];
             if !pen.down {
                 pen.down = true;
-                vm.shared
-                    .pen
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .line(pen, old_position, old_position);
+                vm.pen.line(pen, old_position, old_position);
             }
         }
         20 => vm.pens[target].down = false,
@@ -1926,11 +1969,7 @@ pub(crate) extern "C" fn rt_action(vm: &mut Vm, op: u32, a: u64, b: u64) {
         _ => {}
     }
     if matches!(op, 0..=5) && vm.pens[target].down && old_position != (s.x, s.y) {
-        vm.shared
-            .pen
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .line(&vm.pens[target], old_position, (s.x, s.y));
+        vm.pen.line(&vm.pens[target], old_position, (s.x, s.y));
     }
     if matches!(op, 6..=8) {
         s.direction = (s.direction + 180.0).rem_euclid(360.0) - 180.0;
@@ -1948,6 +1987,60 @@ pub(crate) extern "C" fn rt_action(vm: &mut Vm, op: u32, a: u64, b: u64) {
 #[cfg(test)]
 mod scheduler_tests {
     use super::*;
+
+    #[test]
+    fn warp_erase_and_redraw_survive_many_host_checkpoints() -> Result<()> {
+        use crate::pen::PenCommand;
+        let project = Arc::new(serde_json::from_value::<Project>(
+            serde_json::json!({"targets":[{
+                "name":"Stage", "isStage":true, "variables":{"n":["n",0]}, "blocks":{
+                    "flag":{"opcode":"event_whenflagclicked","topLevel":true,"next":"call"},
+                    "call":{"opcode":"procedures_call","mutation":{"proccode":"draw","argumentids":"[]"}},
+                    "def":{"opcode":"procedures_definition","topLevel":true,"inputs":{"custom_block":[1,"proto"]},"next":"erase"},
+                    "proto":{"opcode":"procedures_prototype","mutation":{"proccode":"draw","argumentids":"[]","argumentnames":"[]","argumentdefaults":"[]","warp":"true"}},
+                    "erase":{"opcode":"pen_clear","next":"repeat"},
+                    "repeat":{"opcode":"control_repeat","inputs":{"TIMES":[1,[4,"50000"]],"SUBSTACK":[2,"inc"]},"next":"down"},
+                    "inc":{"opcode":"data_changevariableby","fields":{"VARIABLE":["n","n"]},"inputs":{"VALUE":[1,[4,"1"]]}},
+                    "down":{"opcode":"pen_penDown"}
+                }
+            }]}),
+        )?);
+        let running = spawn(
+            project,
+            RuntimeOptions {
+                turbo: true,
+                warp_timeout: Duration::from_micros(50),
+                time_limit: Some(Duration::from_secs(10)),
+                ..Default::default()
+            },
+        )?;
+        let scene = running.scene.clone();
+        scene.gpu_pen.store(true, Ordering::Release);
+        while !running.is_finished() {
+            let layer = scene.pen.lock().unwrap();
+            if layer
+                .commands
+                .iter()
+                .any(|c| matches!(c, PenCommand::Clear))
+            {
+                assert!(
+                    layer
+                        .commands
+                        .iter()
+                        .any(|c| matches!(c, PenCommand::Line(_))),
+                    "a host checkpoint exposed erase before redraw"
+                );
+            }
+            drop(layer);
+            thread::sleep(Duration::from_micros(50));
+        }
+        let report = running.join()?;
+        assert!(!report.interrupted);
+        assert_eq!(report.variables[0].value, ScratchValue::Number(50000.));
+        assert!(report.yields > 1, "fixture did not cross host checkpoints");
+        assert_eq!(scene.pen.lock().unwrap().commands.len(), 2);
+        Ok(())
+    }
 
     #[test]
     fn finished_receivers_do_not_make_ready_callers_sleep() {
