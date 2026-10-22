@@ -47,3 +47,55 @@ python tools/benchmark.py path/to/before.exe path/to/after.exe `
 
 Omit `--project` to run only the four self-contained generated workloads.
 See [windows-2026-10-21.json](windows-2026-10-21.json) for all release samples.
+
+## sub1k pen rendering, 2026-10-22
+
+The pen renderer previously rasterized every stroke on the CPU and allowed
+the display to read a canvas while a script erased and rebuilt it. Native and
+streaming displays now draw instanced GPU capsules and publish pen work at
+scheduler boundaries. Short host interruptions inside warp scripts retain the
+previous pen image. Numeric string coercions and numeric string list indices
+also have native fast paths in runtime revision `9e222c3`.
+
+On the same i5-8300H and a GTX 1050 Ti using DX12, three alternating samples
+per backend each completed **30 render calls**, including scene initialization:
+
+| Camera pitch | CPU pen, median frames/s | GPU pen, median frames/s | Speedup |
+| --- | ---: | ---: | ---: |
+| Initial view, 0 degrees | 4.60 | 23.21 | 5.05x |
+| Steep view, 103.3 degrees | 4.33 | 23.83 | 5.51x |
+
+These isolate CPU versus GPU pen drawing within the same optimized runtime.
+They include GPU stage capture/readback but omit the native window blit and
+video encoding. Loading and JIT compilation are excluded; project initialization
+and rendering quality are retained. Background applications were left running:
+steep-view GPU samples ranged from 14.66 to 27.82 frames/s, so these short runs
+do not establish stable 30 FPS or TurboWarp parity. Final stage images matched
+the CPU reference with mean absolute channel error below one 8-bit level;
+variable-monitor text was excluded from the image comparison.
+
+The installed native player also completed a separate **357 frames in 10 seconds
+(35.70 frames/s)** at 103.3 degrees, with the same quality settings and an explicit
+completion counter. Its final project FPS reporter read 38.37. A ten-second run
+of the unchanged original project advanced its frame-start counter by 347 and
+ended with an FPS reading of 33.31; that counter increments before drawing and
+is not an exact count of completed frames. These are separate smoke runs, not
+medians or guarantees of sustained frame rate. The longer runs amortize project
+initialization differently from the 30-frame samples.
+
+See [all samples and native smoke results](sub1k-2026-10-22.json). The external
+project and its assets are not redistributed. To reproduce:
+
+```powershell
+python tools/benchmark_sub1k.py D:/Downloads/sub1k.sb3 local/sub1k-30.sb3 --rot-x 103.3
+$env:MSBJIT_PEN_BENCH_PROJECT = (Resolve-Path local/sub1k-30.sb3).Path
+$env:MSBJIT_PEN_BENCH_OUTPUT = "local/sub1k-results.json"
+cargo test --release --lib sub1k_complete_frames -- --ignored --nocapture
+```
+
+Omit `--rot-x` for the original initialized view. The generated fixture changes
+the main forever loop to repeat 30, waits for the render broadcast, and moves
+the frame-counter increment after the render call. This prevents a restarted,
+unfinished warp script from being counted as a completed frame. Rendering
+procedures, resolution, lighting, shadows, assets, and other quality settings
+are unchanged. The original archive is untouched.

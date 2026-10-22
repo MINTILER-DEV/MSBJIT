@@ -1,0 +1,161 @@
+{
+  "runtime_commit": "9e222c3",
+  "benchmark_tool_commit": "f5c0450",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "cpu": "Intel Core i5-8300H",
+  "gpu": "NVIDIA GeForce GTX 1050 Ti, DX12",
+  "profile": "release, opt-level 3, thin LTO, codegen-units 1",
+  "source_sha256": "4cc7c8892b7db426cc11abb89a39e997386661a8f040ea5646cbe8fd8101af67",
+  "method": "30 completed render calls per sample. Alternate CPU/GPU pen drawing within the same runtime. The benchmark fixture makes the render broadcast wait, moves the frame counter after the render call, and changes the outer forever to repeat 30. Rendering procedures, assets, resolution and quality settings are unchanged. GPU stage capture/readback polls with an 8 ms sleep. No native window blit or video encoding. Three samples per backend; JIT compilation/loading excluded. Background user applications remain running.",
+  "cases": {
+    "initial_view": {
+      "rot_x": 0,
+      "samples": [
+        {
+          "elapsed": 6.5256958,
+          "fps": 4.597210921171042,
+          "frames": 30,
+          "gpu": false,
+          "steps": 24584772
+        },
+        {
+          "elapsed": 1.2926655,
+          "fps": 23.207860038037683,
+          "frames": 30,
+          "gpu": true,
+          "steps": 24584743
+        },
+        {
+          "elapsed": 0.9771687,
+          "fps": 30.700942426829677,
+          "frames": 30,
+          "gpu": true,
+          "steps": 24584743
+        },
+        {
+          "elapsed": 6.7321372,
+          "fps": 4.456237166408314,
+          "frames": 30,
+          "gpu": false,
+          "steps": 24584772
+        },
+        {
+          "elapsed": 6.2836713,
+          "fps": 4.774279011061575,
+          "frames": 30,
+          "gpu": false,
+          "steps": 24584772
+        },
+        {
+          "elapsed": 1.4083549,
+          "fps": 21.30144894585875,
+          "frames": 30,
+          "gpu": true,
+          "steps": 24584743
+        }
+      ],
+      "median_fps": {
+        "cpu": 4.597210921171042,
+        "gpu": 23.207860038037683
+      },
+      "speedup": 5.048247825907011,
+      "image_comparison": "passed; final stage mean absolute channel difference less than 1/255; monitors excluded"
+    },
+    "steep_view": {
+      "rot_x": 103.3,
+      "samples": [
+        {
+          "elapsed": 6.9315278,
+          "fps": 4.328050159446811,
+          "frames": 30,
+          "gpu": false,
+          "steps": 24638832
+        },
+        {
+          "elapsed": 1.0782777000000001,
+          "fps": 27.822146372868506,
+          "frames": 30,
+          "gpu": true,
+          "steps": 24638803
+        },
+        {
+          "elapsed": 1.2587036999999999,
+          "fps": 23.834044501497853,
+          "frames": 30,
+          "gpu": true,
+          "steps": 24638804
+        },
+        {
+          "elapsed": 6.4027353,
+          "fps": 4.685497462311147,
+          "frames": 30,
+          "gpu": false,
+          "steps": 24638832
+        },
+        {
+          "elapsed": 10.1997792,
+          "fps": 2.9412401397865553,
+          "frames": 30,
+          "gpu": false,
+          "steps": 24638832
+        },
+        {
+          "elapsed": 2.0464522,
+          "fps": 14.659516601462766,
+          "frames": 30,
+          "gpu": true,
+          "steps": 24638808
+        }
+      ],
+      "median_fps": {
+        "cpu": 4.328050159446811,
+        "gpu": 23.834044501497853
+      },
+      "speedup": 5.50687806828565,
+      "image_comparison": "passed; final stage mean absolute channel difference less than 1/255; monitors excluded"
+    }
+  },
+  "native_smoke": {
+    "unchanged_original": {
+      "commit": "9e222c3",
+      "steps": 283808538,
+      "elapsed": 10.0000131,
+      "variables": [
+        {
+          "target": "Stage",
+          "id": "?=%#L1ZYhc4Iez$nd9zE",
+          "name": "System: Frames Elapsed",
+          "value": 348.0
+        },
+        {
+          "target": "Stage",
+          "id": "df[nAo,T0bxAZ7L/(+xO",
+          "name": "Rendering: Tris Filled",
+          "value": "0"
+        },
+        {
+          "target": "Stage",
+          "id": "qmmr8N2cVcB9F7Wx3f`l",
+          "name": "System: FPS",
+          "value": 33.31002618870487
+        }
+      ],
+      "stderr": "Graphics: NVIDIA GeForce GTX 1050 Ti (Dx12)\n"
+    },
+    "steep_view_completed_counter": {
+      "commit": "9e222c3",
+      "steps": 293411819,
+      "elapsed": 10.0000219,
+      "completed_frames": 357.0,
+      "completed_fps": 35.69992181717122,
+      "variables": {
+        "System: Frames Elapsed": 358.0,
+        "Rendering: Tris Filled": "0",
+        "System: FPS": 38.36987362189574
+      },
+      "stderr": "Graphics: NVIDIA GeForce GTX 1050 Ti (Dx12)\n",
+      "fixture": "benchmark_sub1k.py --frames 100000 --rot-x 103.3; stopped by --seconds 10"
+    },
+    "installed_binary_sha256": "5bb60d9cd6de3fa4df14162050458bc5256faa0970d74095d0d8cc635dd4ac77"
+  }
+}
