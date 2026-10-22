@@ -24,10 +24,13 @@ use std::{
 };
 
 pub const DEFAULT_USERNAME: &str = "Player1";
+pub const DEFAULT_LANGUAGE: &str = "English";
+pub(crate) const MAX_CLONES: usize = 300;
 
 #[derive(Debug, Clone)]
 pub struct RuntimeOptions {
     pub username: String,
+    pub language: String,
     pub turbo: bool,
     pub tick_hz: f64,
     pub warp_timeout: Duration,
@@ -38,6 +41,7 @@ impl Default for RuntimeOptions {
     fn default() -> Self {
         Self {
             username: DEFAULT_USERNAME.into(),
+            language: DEFAULT_LANGUAGE.into(),
             turbo: false,
             tick_hz: 30.0,
             warp_timeout: Duration::from_millis(500),
@@ -48,6 +52,11 @@ impl Default for RuntimeOptions {
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct SpriteState {
+    pub id: usize,
+    pub target: usize,
+    pub is_clone: bool,
+    pub active: bool,
+    pub layer_order: i64,
     pub effects: crate::effects::GraphicEffects,
     pub name: String,
     pub is_stage: bool,
@@ -60,6 +69,7 @@ pub struct SpriteState {
     pub rotation_style: String,
 }
 struct AtomicSprite {
+    layer_order: AtomicU64,
     effects: [AtomicU64; 7],
     x: AtomicU64,
     y: AtomicU64,
@@ -74,6 +84,7 @@ pub struct SharedScene {
     pub(crate) monitors: Mutex<Vec<crate::monitors::Monitor>>,
     pub input: InputController,
     sprites: Vec<AtomicSprite>,
+    clones: Mutex<Vec<SpriteState>>,
     pub stopped: AtomicBool,
     pub steps: AtomicU64,
     pub finished: AtomicBool,
@@ -84,10 +95,12 @@ impl SharedScene {
             pen: Mutex::new(PenCanvas::default()),
             monitors: Mutex::new(crate::monitors::create(project)),
             input: InputController::default(),
+            clones: Mutex::new(Vec::new()),
             sprites: project
                 .targets
                 .iter()
                 .map(|t| AtomicSprite {
+                    layer_order: AtomicU64::new(t.layer_order as i64 as u64),
                     effects: std::array::from_fn(|_| AtomicU64::new(0)),
                     x: AtomicU64::new(t.x.to_bits()),
                     y: AtomicU64::new(t.y.to_bits()),
@@ -104,10 +117,17 @@ impl SharedScene {
         }
     }
     pub fn snapshot(&self, project: &Project) -> Vec<SpriteState> {
-        self.sprites
+        let mut states: Vec<_> = self
+            .sprites
             .iter()
             .zip(&project.targets)
-            .map(|(s, t)| SpriteState {
+            .enumerate()
+            .map(|(id, (s, t))| SpriteState {
+                id,
+                target: id,
+                is_clone: false,
+                active: true,
+                layer_order: s.layer_order.load(Ordering::Relaxed) as i64,
                 effects: crate::effects::GraphicEffects::from_values(std::array::from_fn(|i| {
                     f64::from_bits(s.effects[i].load(Ordering::Relaxed))
                 })),
@@ -121,7 +141,15 @@ impl SharedScene {
                 costume: s.costume.load(Ordering::Relaxed),
                 rotation_style: rotation_name(s.rotation.load(Ordering::Relaxed)).into(),
             })
-            .collect()
+            .collect();
+        states.extend(
+            self.clones
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .cloned(),
+        );
+        states
     }
 }
 fn rotation_id(s: &str) -> usize {
@@ -252,6 +280,13 @@ struct Fiber {
     wake: Option<Instant>,
     waiting: HashSet<u64>,
     done: bool,
+    glide: Option<Glide>,
+}
+struct Glide {
+    start: Instant,
+    duration: f64,
+    from: (f64, f64),
+    to: (f64, f64),
 }
 impl Fiber {
     fn new(id: u64, target: usize, pc: usize, loops: usize) -> Self {
@@ -269,6 +304,7 @@ impl Fiber {
             wake: None,
             waiting: HashSet::new(),
             done: false,
+            glide: None,
         }
     }
     fn warp(&self) -> bool {
@@ -279,6 +315,13 @@ enum Event {
     Broadcast { name: String, wait: bool },
     StopOthers,
     StopAll,
+    CloneStart(usize),
+    DeleteClone(usize),
+}
+struct CloneData {
+    vars: Vec<u64>,
+    lists: Vec<RuntimeList>,
+    views: Vec<ListView>,
 }
 fn refresh_waiters(fibers: &mut [Fiber]) {
     if fibers.iter().any(|f| !f.waiting.is_empty()) {
@@ -299,6 +342,8 @@ pub(crate) struct JitState {
     pub budget: u32,
     pub pc: u32,
     pub yield_on_loop: u32,
+    pub local_vars: *mut u64,
+    pub local_lists: *mut ListView,
 }
 #[repr(C)]
 pub(crate) struct Vm {
@@ -310,6 +355,8 @@ pub(crate) struct Vm {
     vars: Vec<u64>,
     lists: Vec<RuntimeList>,
     list_views: Vec<ListView>,
+    clones: Vec<Option<CloneData>>,
+    next_sprite_id: usize,
     pens: Vec<PenState>,
     audio: AudioPlayer,
     #[cfg(feature = "graphics")]
@@ -358,12 +405,16 @@ impl Vm {
                 budget: 0,
                 pc: 0,
                 yield_on_loop: 0,
+                local_vars: vars.as_mut_ptr(),
+                local_lists: list_views.as_mut_ptr(),
             },
             input: InputState::default(),
             interactive: false,
             vars,
             lists,
             list_views,
+            clones: Vec::new(),
+            next_sprite_id: project.targets.len(),
             pens: vec![PenState::default(); project.targets.len()],
             audio: AudioPlayer::default(),
             #[cfg(feature = "graphics")]
@@ -403,7 +454,137 @@ impl Vm {
             self.publish_effects(id);
         }
     }
+    fn bind_instance(&mut self, target: usize) {
+        if let Some(data) = target
+            .checked_sub(self.project.targets.len())
+            .and_then(|i| self.clones[i].as_mut())
+        {
+            self.jit.local_vars = data.vars.as_mut_ptr();
+            self.jit.local_lists = data.views.as_mut_ptr();
+        } else {
+            self.jit.local_vars = self.vars.as_mut_ptr();
+            self.jit.local_lists = self.list_views.as_mut_ptr();
+        }
+    }
+    fn create_clone(&mut self, name: &str) {
+        if self.clones.iter().flatten().count() >= MAX_CLONES {
+            return;
+        }
+        let source = if name == "_myself_" {
+            Some(self.current.target)
+        } else {
+            self.project
+                .targets
+                .iter()
+                .position(|t| !t.is_stage && t.name == name)
+        };
+        let Some(source) = source.filter(|&i| self.sprites[i].active && !self.sprites[i].is_stage)
+        else {
+            return;
+        };
+        let origin = self.sprites[source].target;
+        let source_data = source
+            .checked_sub(self.project.targets.len())
+            .and_then(|i| self.clones[i].as_ref());
+        let mut vars = vec![0; self.vars.len()];
+        for (i, (owner, _, _)) in self.program.variable_names.iter().enumerate() {
+            if *owner == origin {
+                vars[i] = source_data.map_or(self.vars[i], |c| c.vars[i]);
+            }
+        }
+        let mut lists: Vec<_> = self
+            .program
+            .list_names
+            .iter()
+            .enumerate()
+            .map(|(i, (owner, _, _))| {
+                if *owner == origin {
+                    source_data.map_or_else(|| self.lists[i].clone(), |c| c.lists[i].clone())
+                } else {
+                    RuntimeList::new(vec![])
+                }
+            })
+            .collect();
+        let views = lists.iter_mut().map(RuntimeList::view).collect();
+        let data = CloneData { vars, lists, views };
+        let mut sprite = self.sprites[source].clone();
+        sprite.id = self.next_sprite_id;
+        self.next_sprite_id += 1;
+        sprite.is_clone = true;
+        let layer = sprite.layer_order;
+        for s in &mut self.sprites {
+            if s.active && !s.is_stage && s.layer_order >= layer {
+                s.layer_order += 1;
+            }
+        }
+        let pen = self.pens[source].clone();
+        let index = if let Some(i) = self.clones.iter().position(Option::is_none) {
+            let target = self.project.targets.len() + i;
+            self.clones[i] = Some(data);
+            self.sprites[target] = sprite;
+            self.pens[target] = pen;
+            target
+        } else {
+            let target = self.sprites.len();
+            self.clones.push(Some(data));
+            self.sprites.push(sprite);
+            self.pens.push(pen);
+            target
+        };
+        for i in 0..self.sprites.len() {
+            self.publish_sprite(i);
+        }
+        self.events.push(Event::CloneStart(index));
+    }
+    fn delete_clone(&mut self, target: usize) {
+        if target < self.project.targets.len() {
+            return;
+        }
+        self.sprites[target].active = false;
+        self.sprites[target].visible = false;
+        self.clones[target - self.project.targets.len()] = None;
+        self.pens[target].down = false;
+        self.publish_sprite(target);
+    }
+    fn clear_clones(&mut self) {
+        for i in self.project.targets.len()..self.sprites.len() {
+            self.delete_clone(i);
+        }
+    }
+    fn layer(&mut self, target: usize, front: bool) {
+        if self.sprites[target].is_stage {
+            return;
+        }
+        let layers = self
+            .sprites
+            .iter()
+            .filter(|s| s.active && !s.is_stage)
+            .map(|s| s.layer_order);
+        self.sprites[target].layer_order = if front {
+            layers.max().unwrap_or(0) + 1
+        } else {
+            layers.min().unwrap_or(0) - 1
+        };
+        self.publish_sprite(target);
+    }
+    fn move_to(&mut self, target: usize, x: f64, y: f64) {
+        let old = (self.sprites[target].x, self.sprites[target].y);
+        self.sprites[target].x = x;
+        self.sprites[target].y = y;
+        if self.pens[target].down {
+            self.shared
+                .pen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .line(&self.pens[target], old, (x, y));
+        }
+        self.publish_sprite(target);
+    }
     fn publish_effects(&self, id: usize) {
+        if id >= self.project.targets.len() {
+            self.publish_sprite(id);
+            return;
+        }
         let s = &self.sprites[id];
         let a = &self.shared.sprites[id];
         for (value, atomic) in s.effects.values().into_iter().zip(&a.effects) {
@@ -412,7 +593,18 @@ impl Vm {
     }
     fn publish_sprite(&self, id: usize) {
         let s = &self.sprites[id];
+        if id >= self.project.targets.len() {
+            let mut clones = self.shared.clones.lock().unwrap_or_else(|e| e.into_inner());
+            let i = id - self.project.targets.len();
+            if i == clones.len() {
+                clones.push(s.clone());
+            } else if let Some(slot) = clones.get_mut(i) {
+                *slot = s.clone();
+            }
+            return;
+        }
         let a = &self.shared.sprites[id];
+        a.layer_order.store(s.layer_order as u64, Ordering::Relaxed);
         a.x.store(s.x.to_bits(), Ordering::Relaxed);
         a.y.store(s.y.to_bits(), Ordering::Relaxed);
         a.direction.store(s.direction.to_bits(), Ordering::Relaxed);
@@ -486,6 +678,7 @@ impl Vm {
                 if matches!(event, InputEvent::Stop | InputEvent::Flag) {
                     fibers.clear();
                     self.audio.stop();
+                    self.clear_clones();
                     self.clear_effects();
                 }
                 if matches!(event, InputEvent::Flag) {
@@ -498,28 +691,39 @@ impl Vm {
                             expected.eq_ignore_ascii_case("any")
                                 || crate::input::normalize_key(expected).as_ref() == Some(key)
                         }
-                        (InputEvent::Click { target }, Hat::Click) => *target == script.target,
+                        (InputEvent::Click { .. }, Hat::Click) => true,
                         _ => false,
                     };
-                    // Input hats do not restart an already-running instance.
-                    if triggered
-                        && fibers.len() < 4096
-                        && !fibers
-                            .iter()
-                            .any(|f| f.receiver == Some(script_id) && !f.done)
-                    {
-                        let mut fiber = Fiber::new(
-                            next_id,
-                            script.target,
-                            script.entry,
-                            self.program.loop_slots,
-                        );
-                        next_id += 1;
-                        fiber.receiver = Some(script_id);
-                        fibers.push(fiber);
+                    if !triggered {
+                        continue;
+                    }
+                    for (target, sprite) in self.sprites.iter().enumerate() {
+                        if !sprite.active
+                            || sprite.target != script.target
+                            || matches!(event, InputEvent::Flag) && sprite.is_clone
+                        {
+                            continue;
+                        }
+                        if let InputEvent::Click { target: id } = &event
+                            && *id != sprite.id
+                        {
+                            continue;
+                        }
+                        if fibers.len() < 4096
+                            && !fibers.iter().any(|f| {
+                                f.receiver == Some(script_id) && f.target == target && !f.done
+                            })
+                        {
+                            let mut f =
+                                Fiber::new(next_id, target, script.entry, self.program.loop_slots);
+                            next_id += 1;
+                            f.receiver = Some(script_id);
+                            fibers.push(f);
+                        }
                     }
                 }
             }
+
             self.ticks += 1;
             let mut index = 0;
             // New broadcasts become runnable during this round. Cap a round to
@@ -544,6 +748,22 @@ impl Vm {
                     continue;
                 }
                 std::mem::swap(&mut self.current, &mut fibers[index]);
+                if let Some(glide) = &self.current.glide {
+                    let progress = (glide.start.elapsed().as_secs_f64() / glide.duration).min(1.0);
+                    let (x, y) = (
+                        glide.from.0 + (glide.to.0 - glide.from.0) * progress,
+                        glide.from.1 + (glide.to.1 - glide.from.1) * progress,
+                    );
+                    self.move_to(self.current.target, x, y);
+                    if progress < 1.0 {
+                        self.current.wake = Some(Instant::now() + tick);
+                        std::mem::swap(&mut self.current, &mut fibers[index]);
+                        index += 1;
+                        continue;
+                    }
+                    self.current.glide = None;
+                }
+                self.bind_instance(self.current.target);
                 self.current.wake = None;
                 self.slice_start = Instant::now();
                 self.warp_start = self.current.warp().then(Instant::now);
@@ -561,42 +781,52 @@ impl Vm {
                                 if !matches!(&script.hat,Hat::Broadcast(n) if n==&name) {
                                     continue;
                                 }
-                                // Preserve a restarted receiver's identity so other
-                                // broadcast-and-wait callers keep waiting for it.
-                                let mut receiver_id = None;
-                                if self.current.receiver == Some(script_id) {
-                                    receiver_id = Some(self.current.id);
-                                    self.current.done = true;
-                                }
-                                for f in &mut fibers {
-                                    if !f.done && f.receiver == Some(script_id) {
-                                        receiver_id = Some(f.id);
-                                        f.done = true;
+                                for (target, sprite) in self.sprites.iter().enumerate() {
+                                    if !sprite.active || sprite.target != script.target {
+                                        continue;
                                     }
+                                    let mut receiver_id = None;
+                                    if self.current.receiver == Some(script_id)
+                                        && self.current.target == target
+                                    {
+                                        receiver_id = Some(self.current.id);
+                                        self.current.done = true;
+                                    }
+                                    for f in &mut fibers {
+                                        if !f.done
+                                            && f.receiver == Some(script_id)
+                                            && f.target == target
+                                        {
+                                            receiver_id = Some(f.id);
+                                            f.done = true;
+                                        }
+                                    }
+                                    if fibers.iter().filter(|f| !f.done).count() >= 4096 {
+                                        self.error = Some(
+                                            "broadcast exceeds 4096 concurrent scripts".into(),
+                                        );
+                                        break;
+                                    }
+                                    let id = receiver_id.unwrap_or_else(|| {
+                                        let id = next_id;
+                                        next_id += 1;
+                                        id
+                                    });
+                                    let mut f = Fiber::new(
+                                        id,
+                                        target,
+                                        script.entry,
+                                        self.program.loop_slots,
+                                    );
+                                    f.receiver = Some(script_id);
+                                    if wait {
+                                        self.current.waiting.insert(id);
+                                    }
+                                    fibers.push(f);
                                 }
-                                if fibers.iter().filter(|f| !f.done).count() >= 4096 {
-                                    self.error =
-                                        Some("broadcast exceeds 4096 concurrent scripts".into());
-                                    break;
-                                }
-                                let id = receiver_id.unwrap_or_else(|| {
-                                    let id = next_id;
-                                    next_id += 1;
-                                    id
-                                });
-                                let mut f = Fiber::new(
-                                    id,
-                                    script.target,
-                                    script.entry,
-                                    self.program.loop_slots,
-                                );
-                                f.receiver = Some(script_id);
-                                if wait {
-                                    self.current.waiting.insert(id);
-                                }
-                                fibers.push(f);
                             }
                         }
+
                         Event::StopOthers => {
                             for f in &mut fibers {
                                 if f.target == self.current.target && f.id != self.current.id {
@@ -606,11 +836,37 @@ impl Vm {
                         }
                         Event::StopAll => {
                             self.audio.stop();
+                            self.clear_clones();
                             self.clear_effects();
                             for fiber in &mut fibers {
                                 fiber.done = true;
                             }
                             self.current.done = true;
+                        }
+                        Event::CloneStart(target) => {
+                            if self.sprites[target].active {
+                                for script in &self.program.scripts {
+                                    if script.target == self.sprites[target].target
+                                        && matches!(script.hat, Hat::Clone)
+                                    {
+                                        fibers.push(Fiber::new(
+                                            next_id,
+                                            target,
+                                            script.entry,
+                                            self.program.loop_slots,
+                                        ));
+                                        next_id += 1;
+                                    }
+                                }
+                            }
+                        }
+                        Event::DeleteClone(target) => {
+                            for fiber in &mut fibers {
+                                if fiber.target == target {
+                                    fiber.done = true;
+                                }
+                            }
+                            self.delete_clone(target);
                         }
                     }
                 }
@@ -631,6 +887,12 @@ impl Vm {
                     .copied()
                     .chain(self.vars.iter().copied())
                     .chain(self.lists.iter().flat_map(RuntimeList::roots))
+                    .chain(self.clones.iter().flatten().flat_map(|c| {
+                        c.vars
+                            .iter()
+                            .copied()
+                            .chain(c.lists.iter().flat_map(RuntimeList::roots))
+                    }))
                     .chain(fibers.iter().flat_map(|f| {
                         f.frames.iter().flat_map(|frame| frame.args.iter().copied())
                     }));
@@ -714,7 +976,8 @@ impl Vm {
         self.program.values.decode(bits)
     }
     fn costume_pixels(&mut self, target: usize) -> Result<Option<Arc<CostumePixels>>> {
-        let Some(costume) = self.project.targets[target]
+        let origin = self.sprites[target].target;
+        let Some(costume) = self.project.targets[origin]
             .costumes
             .get(self.sprites[target].costume)
         else {
@@ -722,7 +985,7 @@ impl Vm {
         };
         #[cfg(feature = "graphics")]
         {
-            let key = (target, self.sprites[target].costume);
+            let key = (origin, self.sprites[target].costume);
             if let Some(pixels) = self.costume_pixels.get(&key) {
                 return Ok(Some(pixels.clone()));
             }
@@ -773,7 +1036,7 @@ impl Vm {
         if !self.interactive {
             return Ok(());
         }
-        let sounds = &self.project.targets[self.current.target].sounds;
+        let sounds = &self.project.targets[self.sprites[self.current.target].target].sounds;
         let name = value.text();
         let sound = sounds.iter().find(|s| s.name == name).or_else(|| {
             let n = value.to_number();
@@ -815,7 +1078,8 @@ pub(crate) extern "C" fn rt_checkpoint(vm: &mut Vm, pc: u32) -> u32 {
     if vm.current.warp() {
         let start = *vm.warp_start.get_or_insert(now);
         if now.duration_since(start) >= vm.options.warp_timeout {
-            vm.fail("warp watchdog interrupted execution after its time budget (maximum 500 ms)");
+            // Scratch cooperatively interrupts a long warp slice, preserving
+            // its stack and PC. Expensive rendering is not a project error.
             return 1;
         }
     } else {
@@ -857,54 +1121,62 @@ pub(crate) extern "C" fn rt_list(vm: &mut Vm, op: u32, slot: u32, a: u64, b: u64
     const LIMIT: usize = 200_000;
     let slot = slot as usize;
     let arg = vm.value(a);
-    let length = vm.lists[slot].len();
+    let (lists, views) = if vm.current.target >= vm.project.targets.len()
+        && vm.program.list_names[slot].0 != vm.program.stage
+    {
+        let data = vm.clones[vm.current.target - vm.project.targets.len()]
+            .as_mut()
+            .unwrap();
+        (&mut data.lists, &mut data.views)
+    } else {
+        (&mut vm.lists, &mut vm.list_views)
+    };
+    let list = &mut lists[slot];
+    let values = &mut vm.program.values;
+    let length = list.len();
     let result = match op {
         0 => {
             if length < LIMIT {
-                vm.lists[slot].push(a);
+                list.push(a);
             }
             ScratchValue::Number(0.0)
         }
         1 => {
             if matches!(&arg, ScratchValue::String(s) if s == "all") {
-                vm.lists[slot].clear();
+                list.clear();
             } else if let Some(index) = list_index(&arg, length, &mut vm.random) {
-                vm.lists[slot].remove(index);
+                list.remove(index);
             }
             ScratchValue::Number(0.0)
         }
         2 => {
-            vm.lists[slot].clear();
+            list.clear();
             ScratchValue::Number(0.0)
         }
         3 => {
             if let Some(index) = list_index(&arg, length + 1, &mut vm.random).filter(|i| *i < LIMIT)
             {
-                vm.lists[slot].insert(index, b);
-                if vm.lists[slot].len() > LIMIT {
-                    vm.lists[slot].pop();
+                list.insert(index, b);
+                if list.len() > LIMIT {
+                    list.pop();
                 }
             }
             ScratchValue::Number(0.0)
         }
         4 => {
             if let Some(index) = list_index(&arg, length, &mut vm.random) {
-                vm.lists[slot].replace(index, b);
+                list.replace(index, b);
             }
             ScratchValue::Number(0.0)
         }
         5 => {
             return list_index(&arg, length, &mut vm.random)
-                .map(|i| vm.lists[slot][i])
-                .unwrap_or_else(|| {
-                    vm.program
-                        .values
-                        .encode(ScratchValue::String(String::new()))
-                });
+                .map(|i| list[i])
+                .unwrap_or_else(|| values.encode(ScratchValue::String(String::new())));
         }
         6 => ScratchValue::Number(length as f64),
         7 => {
-            let values: Vec<_> = vm.lists[slot].iter().map(|v| vm.value(*v)).collect();
+            let values: Vec<_> = list.iter().map(|v| values.decode(*v)).collect();
             let single = values
                 .iter()
                 .all(|v| matches!(v, ScratchValue::String(s) if s.encode_utf16().count() == 1));
@@ -917,9 +1189,9 @@ pub(crate) extern "C" fn rt_list(vm: &mut Vm, op: u32, slot: u32, a: u64, b: u64
             )
         }
         8 | 9 => {
-            let index = vm.lists[slot]
+            let index = list
                 .iter()
-                .position(|v| vm.value(*v).compare(&arg).is_eq());
+                .position(|v| values.decode(*v).compare(&arg).is_eq());
             if op == 9 {
                 ScratchValue::Boolean(index.is_some())
             } else {
@@ -928,8 +1200,8 @@ pub(crate) extern "C" fn rt_list(vm: &mut Vm, op: u32, slot: u32, a: u64, b: u64
         }
         _ => ScratchValue::Number(0.0),
     };
-    vm.list_views[slot] = vm.lists[slot].view();
-    vm.program.values.encode(result)
+    views[slot] = list.view();
+    values.encode(result)
 }
 pub(crate) extern "C" fn rt_call_args(vm: &mut Vm, count: u32) -> *mut u64 {
     vm.call_args.resize(count as usize, 0);
@@ -1002,6 +1274,31 @@ pub(crate) extern "C" fn rt_wait(vm: &mut Vm, seconds: f64, next: u32) {
     vm.current.pc = next as usize;
     vm.jit.pc = next;
 }
+pub(crate) extern "C" fn rt_glide(vm: &mut Vm, seconds: f64, x: f64, y: f64, next: u32) -> u32 {
+    let target = vm.current.target;
+    if seconds <= 0.0 || seconds.is_nan() {
+        vm.move_to(target, x, y);
+        return 0;
+    }
+    vm.current.glide = Some(Glide {
+        start: Instant::now(),
+        duration: seconds,
+        from: (vm.sprites[target].x, vm.sprites[target].y),
+        to: (x, y),
+    });
+    vm.current.wake = Some(Instant::now() + Duration::from_secs_f64(1.0 / vm.options.tick_hz));
+    vm.jit.pc = next;
+    vm.current.pc = next as usize;
+    1
+}
+pub(crate) extern "C" fn rt_delete_clone(vm: &mut Vm) -> u32 {
+    if vm.current.target < vm.project.targets.len() {
+        return 0;
+    }
+    vm.current.done = true;
+    vm.events.push(Event::DeleteClone(vm.current.target));
+    1
+}
 pub(crate) extern "C" fn rt_broadcast(vm: &mut Vm, name: u64, wait: u32, next: u32) {
     if vm.events.len() >= 4096 {
         vm.fail("broadcast exceeds 4096 pending events");
@@ -1017,9 +1314,8 @@ pub(crate) extern "C" fn rt_broadcast(vm: &mut Vm, name: u64, wait: u32, next: u
 pub(crate) extern "C" fn rt_stop(vm: &mut Vm, mode: u32) {
     match mode {
         0 => {
-            if vm.interactive {
-                vm.events.push(Event::StopAll);
-            } else {
+            vm.events.push(Event::StopAll);
+            if !vm.interactive {
                 vm.shared.stopped.store(true, Ordering::Relaxed);
             }
             vm.current.done = true;
@@ -1132,6 +1428,12 @@ pub(crate) extern "C" fn rt_unary(vm: &mut Vm, op: u32, a: u64) -> u64 {
     vm.program.values.encode(result)
 }
 pub(crate) extern "C" fn rt_state(vm: &mut Vm, field: u32) -> u64 {
+    if field == 12 {
+        return vm
+            .program
+            .values
+            .encode(ScratchValue::String(vm.options.language.clone()));
+    }
     if field == 11 {
         return vm
             .program
@@ -1152,7 +1454,7 @@ pub(crate) extern "C" fn rt_state(vm: &mut Vm, field: u32) -> u64 {
     }
     let s = &vm.sprites[vm.current.target];
     if field == 6 {
-        let name = vm.project.targets[vm.current.target]
+        let name = vm.project.targets[s.target]
             .costumes
             .get(s.costume)
             .map(|c| c.name.clone())
@@ -1173,6 +1475,14 @@ pub(crate) extern "C" fn rt_state(vm: &mut Vm, field: u32) -> u64 {
 }
 pub(crate) extern "C" fn rt_action(vm: &mut Vm, op: u32, a: u64, b: u64) {
     let value = vm.value(a);
+    if op == 33 {
+        vm.create_clone(&value.text());
+        return;
+    }
+    if op == 35 {
+        vm.layer(vm.current.target, value.text() == "front");
+        return;
+    }
     if op == 28 || op == 29 {
         let slot = value.to_number() as usize;
         let mut monitors = vm.shared.monitors.lock().unwrap_or_else(|e| e.into_inner());
@@ -1229,7 +1539,7 @@ pub(crate) extern "C" fn rt_action(vm: &mut Vm, op: u32, a: u64, b: u64) {
                 .push_back(format!("{}: {}", s.name, value.text()));
         }
         14 | 15 => {
-            let costumes = &vm.project.targets[target].costumes;
+            let costumes = &vm.project.targets[s.target].costumes;
             if !costumes.is_empty() {
                 if op == 15 {
                     s.costume = (s.costume + 1) % costumes.len();

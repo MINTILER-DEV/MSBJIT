@@ -2,6 +2,7 @@
 use crate::value::STRING_TAG;
 use std::{collections::HashMap, ops::Deref};
 
+#[derive(Clone)]
 pub(crate) struct RuntimeList {
     values: Vec<u64>,
     strings: HashMap<u64, usize>,

@@ -31,6 +31,8 @@ pub(crate) enum Op {
     RepeatDec(usize, usize),
     ForEachCheck(usize, usize, Expr, usize, usize),
     Wait(Expr),
+    Glide(Expr, Expr, Expr),
+    DeleteClone,
     Yield(usize),
     Broadcast(Expr, bool),
     Call(usize, Vec<Expr>),
@@ -48,6 +50,7 @@ pub(crate) enum Hat {
     Broadcast(String),
     Key(String),
     Click,
+    Clone,
 }
 #[derive(Debug)]
 pub(crate) struct Script {
@@ -64,6 +67,7 @@ pub(crate) struct Procedure {
     pub defaults: Vec<ScratchValue>,
 }
 pub(crate) struct Program {
+    pub stage: usize,
     pub nodes: Vec<Node>,
     pub scripts: Vec<Script>,
     pub procedures: Vec<Procedure>,
@@ -93,6 +97,7 @@ impl Program {
         let mut l = Lower {
             project,
             program: Self {
+                stage: project.targets.iter().position(|t| t.is_stage).unwrap(),
                 nodes: vec![Node {
                     op: Op::Return,
                     next: 0,
@@ -193,6 +198,7 @@ impl Program {
                 }
                 let hat = match b.opcode.as_str() {
                     "event_whenflagclicked" => Hat::Flag,
+                    "control_start_as_clone" => Hat::Clone,
                     "event_whenkeypressed" => Hat::Key(b.field("KEY_OPTION")?.to_owned()),
                     "event_whenthisspriteclicked" | "event_whenstageclicked" => Hat::Click,
                     "event_whenbroadcastreceived" => {
@@ -435,6 +441,7 @@ impl Lower<'_> {
                 "sensing_mousedown" => 9,
                 "sensing_dayssince2000" => 10,
                 "sensing_username" => 11,
+                "translate_getViewerLanguage" => 12,
                 "sensing_touchingobjectmenu" => {
                     return Ok(
                         self.constant(ScratchValue::String(b.field("TOUCHINGOBJECTMENU")?.into()))
@@ -442,6 +449,9 @@ impl Lower<'_> {
                 }
                 "sound_sounds_menu" => {
                     return Ok(self.constant(ScratchValue::String(b.field("SOUND_MENU")?.into())));
+                }
+                "control_create_clone_of_menu" => {
+                    return Ok(self.constant(ScratchValue::String(b.field("CLONE_OPTION")?.into())));
                 }
                 "sensing_keyoptions" => {
                     return Ok(self.constant(ScratchValue::String(b.field("KEY_OPTION")?.into())));
@@ -667,6 +677,19 @@ impl Lower<'_> {
                 s => bail!("unknown stop option {s}"),
             }),
             "motion_movesteps" => Op::Action(0, self.expr_input(b, "STEPS")?, self.zero()),
+            "motion_glidesecstoxy" => Op::Glide(
+                self.expr_input(b, "SECS")?,
+                self.expr_input(b, "X")?,
+                self.expr_input(b, "Y")?,
+            ),
+            "control_create_clone_of" => {
+                Op::Action(33, self.expr_input(b, "CLONE_OPTION")?, self.zero())
+            }
+            "control_delete_this_clone" => Op::DeleteClone,
+            "looks_gotofrontback" => {
+                let order = self.constant(ScratchValue::String(b.field("FRONT_BACK")?.into()));
+                Op::Action(35, order, self.zero())
+            }
             "motion_gotoxy" => Op::Action(1, self.expr_input(b, "X")?, self.expr_input(b, "Y")?),
             "motion_setx" => Op::Action(2, self.expr_input(b, "X")?, self.zero()),
             "motion_sety" => Op::Action(3, self.expr_input(b, "Y")?, self.zero()),

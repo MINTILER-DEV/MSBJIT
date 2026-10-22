@@ -23,7 +23,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 zip = { version = "2.4", default-features = false, features = ["deflate"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
-resvg = { version = "0.45", default-features = false, optional = true }
+resvg = { version = "0.45", default-features = false, features = ["text"], optional = true }
 ctrlc = "3"
 minifb = { version = "0.28", optional = true }
 pollster = { version = "0.4", optional = true }

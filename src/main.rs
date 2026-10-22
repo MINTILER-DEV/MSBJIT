@@ -27,6 +27,9 @@ struct Args {
     /// Username returned by Scratch's username reporter
     #[arg(long, default_value = runtime::DEFAULT_USERNAME)]
     username: String,
+    /// Viewer language name returned by Translate (e.g. English or Français)
+    #[arg(long, default_value=runtime::DEFAULT_LANGUAGE)]
+    language: String,
     /// Stop execution after this many seconds
     #[arg(long)]
     seconds: Option<f64>,
@@ -106,6 +109,7 @@ fn main() -> Result<()> {
         project.clone(),
         RuntimeOptions {
             username: args.username,
+            language: args.language,
             turbo: args.turbo,
             tick_hz: args.tick_hz,
             warp_timeout: Duration::from_millis(args.watchdog_ms),

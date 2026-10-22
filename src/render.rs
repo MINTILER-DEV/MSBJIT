@@ -64,11 +64,19 @@ pub(crate) struct Renderer {
     readback: wgpu::Buffer,
     vertices: wgpu::Buffer,
     costumes: Vec<Vec<Costume>>,
-    order: Vec<usize>,
     pen_texture: wgpu::Texture,
     pen_bind: wgpu::BindGroup,
     pen_generation: u64,
     monitors: crate::monitors::display::Overlay,
+}
+fn draw_order(states: &[SpriteState]) -> Vec<usize> {
+    let mut order: Vec<_> = states
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| s.active.then_some(i))
+        .collect();
+    order.sort_by_key(|&i| (!states[i].is_stage, states[i].layer_order));
+    order
 }
 impl Renderer {
     pub async fn new(project: &Project) -> Result<Self> {
@@ -314,16 +322,11 @@ impl Renderer {
         });
         let vertices = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: ((project.targets.len() + 1) * 6 * std::mem::size_of::<Vertex>()) as u64,
+            size: ((project.targets.len() + crate::runtime::MAX_CLONES + 1)
+                * 6
+                * std::mem::size_of::<Vertex>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
-        let mut order: Vec<_> = (0..project.targets.len()).collect();
-        order.sort_by_key(|i| {
-            (
-                !project.targets[*i].is_stage,
-                project.targets[*i].layer_order,
-            )
         });
         Ok(Self {
             device,
@@ -333,7 +336,6 @@ impl Renderer {
             readback,
             vertices,
             costumes,
-            order,
             pen_texture,
             pen_bind,
             pen_generation: u64::MAX,
@@ -346,15 +348,15 @@ impl Renderer {
         if !x.is_finite() || !y.is_finite() || x.abs() > 240.0 || y.abs() > 180.0 {
             return None;
         }
-        for &id in self.order.iter().rev() {
+        for id in draw_order(states).into_iter().rev() {
             let state = &states[id];
             if state.is_stage {
-                return Some(id);
+                return Some(state.id);
             }
             if !state.visible || state.effects.ghost >= 100.0 {
                 continue;
             }
-            let Some(costume) = self.costumes[id].get(state.costume) else {
+            let Some(costume) = self.costumes[state.target].get(state.costume) else {
                 continue;
             };
             let scale = state.size / 100.0 / costume.resolution;
@@ -386,7 +388,7 @@ impl Renderer {
                 ],
             );
             if costume.opaque(uv, state) {
-                return Some(id);
+                return Some(state.id);
             }
         }
         None
@@ -441,12 +443,12 @@ impl Renderer {
             });
         }
         let mut draws = vec![];
-        for &id in &self.order {
+        for id in draw_order(states) {
             let state = &states[id];
             if !state.is_stage && !state.visible {
                 continue;
             }
-            let Some(costume) = self.costumes[id].get(state.costume) else {
+            let Some(costume) = self.costumes[state.target].get(state.costume) else {
                 continue;
             };
             let start = vertices.len() as u32;
@@ -516,7 +518,7 @@ impl Renderer {
                     pass.draw(0..6, 0..1);
                     pen_drawn = true;
                 }
-                let c = &self.costumes[id][costume];
+                let c = &self.costumes[states[id].target][costume];
                 let state = &states[id];
                 pass.set_bind_group(
                     0,
@@ -576,6 +578,36 @@ impl Renderer {
 pub(crate) fn decode(name: &str, data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
     if name.to_ascii_lowercase().ends_with(".svg") {
         let mut options = resvg::usvg::Options::default();
+        // Keep costume text available on headless hosts too. Never depend on
+        // installed fonts or resolve external resources from project SVGs.
+        static FONTS: std::sync::OnceLock<std::sync::Arc<resvg::usvg::fontdb::Database>> =
+            std::sync::OnceLock::new();
+        options.fontdb = FONTS
+            .get_or_init(|| {
+                let mut db = resvg::usvg::fontdb::Database::new();
+                db.load_font_data(include_bytes!("../assets/fonts/Arimo-Regular.ttf").to_vec());
+                db.load_font_data(include_bytes!("../assets/fonts/Arimo-Bold.ttf").to_vec());
+                db.load_font_data(include_bytes!("../assets/fonts/Knewave.ttf").to_vec());
+                db.set_sans_serif_family("Arimo");
+                db.set_serif_family("Arimo");
+                std::sync::Arc::new(db)
+            })
+            .clone();
+        options.font_family = "Arimo".into();
+        let select = resvg::usvg::FontResolver::default_font_selector();
+        options.font_resolver.select_font = Box::new(move |font, db| {
+            if font
+                .families()
+                .iter()
+                .any(|f| f.to_string().trim_matches(['\'', '"']) == "Marker")
+            {
+                return db.query(&resvg::usvg::fontdb::Query {
+                    families: &[resvg::usvg::fontdb::Family::Name("Knewave")],
+                    ..Default::default()
+                });
+            }
+            select(font, db)
+        });
         options.image_href_resolver.resolve_string = Box::new(|_, _| None);
         let tree = match resvg::usvg::Tree::from_data(data, &options) {
             Ok(tree) => tree,
@@ -619,6 +651,31 @@ pub(crate) fn decode(name: &str, data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn svg_text_uses_bundled_fonts_and_scratch_marker_alias() -> Result<()> {
+        let svg = |family| {
+            format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="60"><text x="5" y="45" font-family="{family}" font-size="40">B</text></svg>"#
+            )
+        };
+        let (_, _, marker) = decode("text.svg", svg("Marker").as_bytes())?;
+        let (_, _, knewave) = decode("text.svg", svg("Knewave").as_bytes())?;
+        let (_, _, fallback) = decode("text.svg", svg("unavailable-font").as_bytes())?;
+        assert_eq!(marker, knewave);
+        assert_ne!(marker, fallback);
+        for pixels in [&marker, &fallback] {
+            assert!(
+                pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .filter(|p| p[3] > 0)
+                    .count()
+                    > 100
+            );
+        }
+        Ok(())
+    }
     #[test]
     #[ignore = "requires a wgpu graphics adapter"]
     fn all_graphic_effects_match_scratch_webgl_reference() -> Result<()> {
@@ -807,6 +864,218 @@ mod tests {
                 .0
                 .iter()
                 .any(|p| p[3] > 0)
+        );
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires MSBJIT_RAYTRACE_PROJECT and a wgpu adapter"]
+    fn raytrace_intro_rendering_sliders_and_keyboard() -> Result<()> {
+        use crate::{
+            input::InputEvent,
+            runtime::{self, RuntimeOptions},
+        };
+        use std::{
+            sync::Arc,
+            thread,
+            time::{Duration, Instant},
+        };
+        let Ok(path) = std::env::var("MSBJIT_RAYTRACE_PROJECT") else {
+            eprintln!("Set MSBJIT_RAYTRACE_PROJECT to raytrace.sb3");
+            return Ok(());
+        };
+        let project = Arc::new(Project::load(path)?);
+        let mut renderer = pollster::block_on(Renderer::new(&project))?;
+        let running = runtime::spawn_interactive(
+            project.clone(),
+            RuntimeOptions {
+                turbo: true,
+                warp_timeout: Duration::from_millis(20),
+                time_limit: Some(Duration::from_secs(35)),
+                ..Default::default()
+            },
+        )?;
+        let scene = running.scene.clone();
+        scene.input.send(InputEvent::Flag);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let states = scene.snapshot(&project);
+            if states.iter().filter(|s| s.is_clone && s.active).count() == 3
+                && states[3].visible
+                && states[3].size >= 99.0
+            {
+                break;
+            }
+            if running.is_finished() {
+                running.join()?;
+                anyhow::bail!("ray tracer stopped during introduction");
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "introduction clones did not appear"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let intro = scene.snapshot(&project);
+        assert_eq!(intro.iter().filter(|s| s.is_clone && s.active).count(), 3);
+        let rgba = renderer.capture_scene(&scene, &intro)?;
+        if let Ok(path) = std::env::var("MSBJIT_RAYTRACE_INTRO_CAPTURE") {
+            image::save_buffer(path, &rgba, WIDTH, HEIGHT, image::ColorType::Rgba8)?;
+        }
+        let monitor = |name: &str| {
+            scene
+                .monitors
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|m| m.label == name || m.label == format!("pen: {name}"))
+                .cloned()
+        };
+        // The saved file already has visible controls and stale monitor values.
+        // Wait for the actual start broadcast and first pen output instead.
+        while scene
+            .snapshot(&project)
+            .iter()
+            .any(|s| s.is_clone && s.active)
+            || !scene
+                .pen
+                .lock()
+                .unwrap()
+                .pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|p| p[3] > 0)
+        {
+            if running.is_finished() {
+                running.join()?;
+                anyhow::bail!("ray tracer stopped during introduction");
+            }
+            ensure!(Instant::now() < deadline, "introduction timed out");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let slot = monitor("#resolution")
+            .context("missing resolution control")?
+            .slot;
+        scene
+            .input
+            .send(InputEvent::MonitorSlider { slot, value: 8.0 });
+        // Observe two hidden project variables through existing monitor bindings.
+        // Their visibility is restored before the final player capture.
+        for m in scene.monitors.lock().unwrap().iter_mut() {
+            if m.label == "cam xdir" || m.label == "pen: time" {
+                m.visible = true;
+                m.number = 0.0;
+            }
+        }
+        while !monitor("time").is_some_and(|m| m.number > 0.0) {
+            if running.is_finished() {
+                running.join()?;
+                anyhow::bail!("ray tracer stopped before its first frame");
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "first ray-traced frame timed out"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let before = renderer.capture_scene(&scene, &scene.snapshot(&project))?;
+        let pen_before = scene.pen.lock().unwrap().pixels.clone();
+        let camera = monitor("cam xdir").context("missing camera state")?.number;
+        scene.input.send(InputEvent::Key {
+            key: "right arrow".into(),
+            down: true,
+        });
+        while !monitor("cam xdir").is_some_and(|m| m.number != camera) {
+            if running.is_finished() {
+                running.join()?;
+                anyhow::bail!("ray tracer stopped while moving the camera");
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "camera did not accept arrow input"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        scene.input.send(InputEvent::Release);
+        scene.input.send(InputEvent::Key {
+            key: "space".into(),
+            down: true,
+        });
+        thread::sleep(Duration::from_secs(1));
+        scene.input.send(InputEvent::Release);
+        for m in scene.monitors.lock().unwrap().iter_mut() {
+            if m.label == "cam xdir" || m.label == "pen: time" {
+                m.visible = false;
+            }
+        }
+        let after = renderer.capture_scene(&scene, &scene.snapshot(&project))?;
+        assert_ne!(
+            before, after,
+            "camera input did not change the rendered scene"
+        );
+        assert_ne!(
+            pen_before,
+            scene.pen.lock().unwrap().pixels,
+            "camera input did not change pen output"
+        );
+        if let Ok(path) = std::env::var("MSBJIT_RAYTRACE_CAPTURE") {
+            image::save_buffer(path, &after, WIDTH, HEIGHT, image::ColorType::Rgba8)?;
+        }
+        let pen_pixels = scene
+            .pen
+            .lock()
+            .unwrap()
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[3] > 0)
+            .count();
+        assert!(
+            pen_pixels > 10_000,
+            "ray tracer produced only {pen_pixels} pen pixels"
+        );
+        running.stop();
+        let report = running.join()?;
+        assert_eq!(
+            report
+                .variables
+                .iter()
+                .find(|v| v.name == "#resolution")
+                .unwrap()
+                .value
+                .to_number(),
+            8.0
+        );
+        assert_eq!(
+            report
+                .variables
+                .iter()
+                .find(|v| v.name == "Intro")
+                .unwrap()
+                .value
+                .to_number(),
+            4.0
+        );
+        assert!(
+            report
+                .sprites
+                .iter()
+                .filter(|s| s.is_clone)
+                .all(|s| !s.active)
+        );
+        eprintln!(
+            "Ray tracer: {} native steps, {} pen pixels, camera {} -> {}",
+            report.steps,
+            pen_pixels,
+            camera,
+            report
+                .variables
+                .iter()
+                .find(|v| v.name == "cam xdir")
+                .unwrap()
+                .value
+                .text()
         );
         Ok(())
     }

@@ -303,6 +303,11 @@ mod tests {
     }
     fn state() -> SpriteState {
         SpriteState {
+            id: 0,
+            target: 0,
+            is_clone: false,
+            active: true,
+            layer_order: 0,
             effects: Default::default(),
             name: "sprite".into(),
             is_stage: false,

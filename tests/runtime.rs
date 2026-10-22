@@ -30,6 +30,170 @@ fn value<'a>(report: &'a RunReport, id: &str) -> &'a ScratchValue {
     &report.variables.iter().find(|v| v.id == id).unwrap().value
 }
 #[test]
+fn clones_snapshot_local_variables_and_lists_and_share_stage_data() {
+    let p: Project = serde_json::from_value(json!({"targets":[
+        {"name":"Stage","isStage":true,"variables":{"sum":["sum",0]},"lists":{"results":["results",[]]}},
+        {"name":"Sprite","variables":{"local":["local",0]},"lists":{"private":["private",[10]]},"blocks":{
+            "flag":{"opcode":"event_whenflagclicked","topLevel":true,"next":"repeat"},
+            "repeat":{"opcode":"control_repeat","inputs":{"TIMES":[1,[4,"3"]],"SUBSTACK":[2,"create"]},"next":"originalDelete"},
+            "create":{"opcode":"control_create_clone_of","inputs":{"CLONE_OPTION":[1,[10,"_myself_"]]},"next":"increment"},
+            "increment":{"opcode":"data_changevariableby","fields":{"VARIABLE":["local","local"]},"inputs":{"VALUE":[1,[4,"1"]]},"next":"replaceOriginal"},
+            "replaceOriginal":{"opcode":"data_replaceitemoflist","fields":{"LIST":["private","private"]},"inputs":{"INDEX":[1,[4,"1"]],"ITEM":[3,[12,"local","local"],[4,"0"]]}},
+            "originalDelete":{"opcode":"control_delete_this_clone","next":"originalContinues"},
+            "originalContinues":{"opcode":"data_changevariableby","fields":{"VARIABLE":["sum","sum"]},"inputs":{"VALUE":[1,[4,"1000"]]}},
+            "clone":{"opcode":"control_start_as_clone","topLevel":true,"next":"wait"},
+            "wait":{"opcode":"control_wait","inputs":{"DURATION":[1,[4,"0.01"]]},"next":"sum"},
+            "sum":{"opcode":"data_changevariableby","fields":{"VARIABLE":["sum","sum"]},"inputs":{"VALUE":[3,[12,"local","local"],[4,"0"]]},"next":"save"},
+            "save":{"opcode":"data_addtolist","fields":{"LIST":["results","results"]},"inputs":{"ITEM":[2,"item"]},"next":"replace"},
+            "item":{"opcode":"data_itemoflist","fields":{"LIST":["private","private"]},"inputs":{"INDEX":[1,[4,"1"]]}},
+            "replace":{"opcode":"data_replaceitemoflist","fields":{"LIST":["private","private"]},"inputs":{"INDEX":[1,[4,"1"]],"ITEM":[1,[4,"99"]]},"next":"append"},
+            "append":{"opcode":"data_addtolist","fields":{"LIST":["private","private"]},"inputs":{"ITEM":[1,[10,"clone-only"]]},"next":"saveLength"},
+            "saveLength":{"opcode":"data_changevariableby","fields":{"VARIABLE":["sum","sum"]},"inputs":{"VALUE":[2,"length"]},"next":"delete"},
+            "length":{"opcode":"data_lengthoflist","fields":{"LIST":["private","private"]}},
+            "delete":{"opcode":"control_delete_this_clone","next":"never"},
+            "never":{"opcode":"data_changevariableby","fields":{"VARIABLE":["sum","sum"]},"inputs":{"VALUE":[1,[4,"99999"]]}}
+        }}
+    ]})).unwrap();
+    let r = runtime::spawn(
+        Arc::new(p),
+        RuntimeOptions {
+            turbo: true,
+            time_limit: Some(Duration::from_secs(3)),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .join()
+    .unwrap();
+    assert!(!r.interrupted);
+    assert_eq!(value(&r, "sum").to_number(), 1009.0);
+    assert_eq!(value(&r, "local").to_number(), 3.0);
+    assert_eq!(
+        r.lists.iter().find(|l| l.id == "private").unwrap().items,
+        vec![ScratchValue::Number(3.0)]
+    );
+    let mut copies: Vec<_> = r
+        .lists
+        .iter()
+        .find(|l| l.id == "results")
+        .unwrap()
+        .items
+        .iter()
+        .map(ScratchValue::to_number)
+        .collect();
+    copies.sort_by(f64::total_cmp);
+    assert_eq!(copies, vec![1.0, 2.0, 10.0]);
+    assert_eq!(r.sprites.iter().filter(|s| s.is_clone).count(), 3);
+    assert!(r.sprites.iter().filter(|s| s.is_clone).all(|s| !s.active));
+}
+
+#[test]
+fn broadcast_and_wait_runs_receivers_on_each_clone() {
+    let p: Project = serde_json::from_value(json!({"targets":[
+        {"name":"Stage","isStage":true,"variables":{"n":["counter",0]},"blocks":{
+            "flag":{"opcode":"event_whenflagclicked","topLevel":true,"next":"create"},
+            "create":{"opcode":"control_repeat","inputs":{"TIMES":[1,[4,"3"]],"SUBSTACK":[2,"clone"]},"next":"broadcast"},
+            "clone":{"opcode":"control_create_clone_of","inputs":{"CLONE_OPTION":[1,[10,"Sprite"]]}},
+            "broadcast":{"opcode":"event_broadcastandwait","inputs":{"BROADCAST_INPUT":[1,[11,"hello","hello"]]},"next":"multiply"},
+            "multiply":{"opcode":"data_setvariableto","fields":{"VARIABLE":["counter","n"]},"inputs":{"VALUE":[2,"product"]}},
+            "product":{"opcode":"operator_multiply","inputs":{"NUM1":[3,[12,"counter","n"],[4,"0"]],"NUM2":[1,[4,"10"]]}}
+        }},
+        {"name":"Sprite","blocks":{
+            "receive":{"opcode":"event_whenbroadcastreceived","topLevel":true,"fields":{"BROADCAST_OPTION":["hello","hello"]},"next":"wait"},
+            "wait":{"opcode":"control_wait","inputs":{"DURATION":[1,[4,"0.01"]]},"next":"inc"},
+            "inc":{"opcode":"data_changevariableby","fields":{"VARIABLE":["counter","n"]},"inputs":{"VALUE":[1,[4,"1"]]}}
+        }}
+    ]})).unwrap();
+    let r = runtime::spawn(
+        Arc::new(p),
+        RuntimeOptions {
+            turbo: true,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .join()
+    .unwrap();
+    assert_eq!(value(&r, "n").to_number(), 40.0);
+    assert_eq!(
+        r.sprites.iter().filter(|s| s.is_clone && s.active).count(),
+        3
+    );
+    assert!(
+        r.sprites[2..]
+            .iter()
+            .all(|s| s.layer_order < r.sprites[1].layer_order)
+    );
+}
+
+#[test]
+fn clone_limit_is_silent_and_slots_are_reused() {
+    let p: Project = serde_json::from_value(json!({"targets":[
+        {"name":"Stage","isStage":true},
+        {"name":"Sprite","blocks":{
+            "flag":{"opcode":"event_whenflagclicked","topLevel":true,"next":"rounds"},
+            "rounds":{"opcode":"control_repeat","inputs":{"TIMES":[1,[4,"2"]],"SUBSTACK":[2,"repeat"]}},
+            "repeat":{"opcode":"control_repeat","inputs":{"TIMES":[1,[4,"305"]],"SUBSTACK":[2,"create"]},"next":"clean"},
+            "create":{"opcode":"control_create_clone_of","inputs":{"CLONE_OPTION":[1,[10,"_myself_"]]}},
+            "clean":{"opcode":"event_broadcastandwait","inputs":{"BROADCAST_INPUT":[1,[11,"clean","clean"]]}},
+            "receive":{"opcode":"event_whenbroadcastreceived","topLevel":true,"fields":{"BROADCAST_OPTION":["clean","clean"]},"next":"delete"},
+            "delete":{"opcode":"control_delete_this_clone"}
+        }}
+    ]})).unwrap();
+    let r = runtime::spawn(
+        Arc::new(p),
+        RuntimeOptions {
+            turbo: true,
+            time_limit: Some(Duration::from_secs(5)),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .join()
+    .unwrap();
+    assert!(!r.interrupted);
+    assert_eq!(r.sprites.len(), 302);
+    assert!(r.sprites[2..].iter().all(|s| !s.active));
+    assert!(r.sprites[2..].iter().all(|s| s.id >= 302));
+}
+
+#[test]
+fn glide_keeps_real_duration_in_turbo_and_resumes_at_destination() {
+    let r = run(
+        json!({
+            "hat":{"opcode":"event_whenflagclicked","topLevel":true,"next":"glide"},
+            "glide":{"opcode":"motion_glidesecstoxy","inputs":{"SECS":[1,[4,"0.1"]],"X":[1,[4,"80"]],"Y":[1,[4,"-30"]]},"next":"done"},
+            "done":{"opcode":"data_setvariableto","fields":{"VARIABLE":["text","s"]},"inputs":{"VALUE":[1,[10,"done"]]}}
+        }),
+        true,
+    );
+    assert!(r.elapsed_seconds >= 0.1 && r.elapsed_seconds < 2.0);
+    assert_eq!((r.sprites[0].x, r.sprites[0].y), (80.0, -30.0));
+    assert_eq!(value(&r, "s").text(), "done");
+}
+
+#[test]
+fn viewer_language_is_configurable_and_defaults_to_english() {
+    let p = Arc::new(project(json!({
+        "hat":{"opcode":"event_whenflagclicked","topLevel":true,"next":"save"},
+        "save":{"opcode":"data_setvariableto","fields":{"VARIABLE":["text","s"]},"inputs":{"VALUE":[2,"language"]}},
+        "language":{"opcode":"translate_getViewerLanguage"}
+    })));
+    for language in [runtime::DEFAULT_LANGUAGE, "Français"] {
+        let r = runtime::spawn(
+            p.clone(),
+            RuntimeOptions {
+                language: language.into(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .join()
+        .unwrap();
+        assert_eq!(value(&r, "s").text(), language);
+    }
+}
+#[test]
 fn sampled_checkpoints_preserve_exact_step_limits() {
     let p = Arc::new(project(json!({
         "hat":{"opcode":"event_whenflagclicked","topLevel":true,"next":"loop"},
@@ -147,20 +311,25 @@ fn warp_removes_normal_loop_yields() {
     assert_eq!(r.ticks, 1);
 }
 #[test]
-fn warp_watchdog_interrupts_empty_infinite_loop() {
+fn warp_watchdog_yields_and_time_limit_interrupts_empty_infinite_loop() {
     let p = project(warp_project(json!({"loop":{"opcode":"control_forever"}})));
     let now = Instant::now();
-    let error = runtime::spawn(
+    let report = runtime::spawn(
         Arc::new(p),
         RuntimeOptions {
             warp_timeout: Duration::from_millis(20),
+            time_limit: Some(Duration::from_millis(100)),
             ..Default::default()
         },
     )
     .unwrap()
     .join()
-    .unwrap_err();
-    assert!(error.to_string().contains("watchdog"), "{error}");
+    .unwrap();
+    assert!(report.interrupted);
+    assert!(
+        report.yields >= 2,
+        "warp should have yielded before the time limit"
+    );
     assert!(now.elapsed() < Duration::from_secs(3));
 }
 #[test]

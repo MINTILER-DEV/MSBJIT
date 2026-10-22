@@ -88,6 +88,18 @@ impl NativeProgram {
             ),
             ("stop", rt_stop as *const u8, vec![types::I32], None),
             (
+                "delete_clone",
+                rt_delete_clone as *const u8,
+                vec![],
+                Some(types::I32),
+            ),
+            (
+                "glide",
+                rt_glide as *const u8,
+                vec![types::F64, types::F64, types::F64, types::I32],
+                Some(types::I32),
+            ),
+            (
                 "binary",
                 rt_binary as *const u8,
                 vec![types::I32, types::I64, types::I64],
@@ -157,11 +169,35 @@ impl NativeProgram {
                 vm,
                 offset_of!(JitState, lists) as i32,
             );
+            let local_vars = b.ins().load(
+                pointer,
+                ir::MemFlags::trusted(),
+                vm,
+                offset_of!(JitState, local_vars) as i32,
+            );
+            let local_lists = b.ins().load(
+                pointer,
+                ir::MemFlags::trusted(),
+                vm,
+                offset_of!(JitState, local_lists) as i32,
+            );
             let mut e = Emitter {
                 b,
                 vm,
                 vars,
                 lists,
+                local_vars,
+                local_lists,
+                variable_local: program
+                    .variable_names
+                    .iter()
+                    .map(|(target, _, _)| *target != program.stage)
+                    .collect(),
+                list_local: program
+                    .list_names
+                    .iter()
+                    .map(|(target, _, _)| *target != program.stage)
+                    .collect(),
                 pointer,
                 funcs,
             };
@@ -180,24 +216,26 @@ impl NativeProgram {
                 match &node.op {
                     Op::Set(slot, x) => {
                         let x = e.expr(x);
+                        let vars = e.variable_base(*slot);
                         e.b.ins()
-                            .store(ir::MemFlags::trusted(), x, e.vars, (*slot * 8) as i32);
+                            .store(ir::MemFlags::trusted(), x, vars, (*slot * 8) as i32);
                         e.b.ins().jump(next, &[]);
                     }
                     Op::Change(slot, x) => {
                         let x = e.expr(x);
                         let x = e.num(x);
+                        let vars = e.variable_base(*slot);
                         let old = e.b.ins().load(
                             types::I64,
                             ir::MemFlags::trusted(),
-                            e.vars,
+                            vars,
                             (*slot * 8) as i32,
                         );
                         let old = e.num(old);
                         let sum = e.b.ins().fadd(old, x);
                         let bits = e.bits(sum);
                         e.b.ins()
-                            .store(ir::MemFlags::trusted(), bits, e.vars, (*slot * 8) as i32);
+                            .store(ir::MemFlags::trusted(), bits, vars, (*slot * 8) as i32);
                         e.b.ins().jump(next, &[]);
                     }
                     Op::Action(op, a, b) => {
@@ -262,10 +300,11 @@ impl NativeProgram {
                         let index = e.b.ins().fadd(index, one);
                         e.call("loop_set", &[slot, index]);
                         let value = e.bits(index);
+                        let vars = e.variable_base(*variable);
                         e.b.ins().store(
                             ir::MemFlags::trusted(),
                             value,
-                            e.vars,
+                            vars,
                             (*variable * 8) as i32,
                         );
                         e.b.ins().jump(blocks[*yes], &[]);
@@ -282,6 +321,21 @@ impl NativeProgram {
                         let pc = e.i32(node.next);
                         e.call("wait", &[seconds, pc]);
                         e.b.ins().jump(exit, &[]);
+                    }
+                    Op::Glide(seconds, x, y) => {
+                        let seconds = e.expr(seconds);
+                        let seconds = e.num(seconds);
+                        let x = e.expr(x);
+                        let x = e.num(x);
+                        let y = e.expr(y);
+                        let y = e.num(y);
+                        let pc = e.i32(node.next);
+                        let waiting = e.call("glide", &[seconds, x, y, pc]).unwrap();
+                        e.b.ins().brif(waiting, exit, &[], next, &[]);
+                    }
+                    Op::DeleteClone => {
+                        let deleted = e.call("delete_clone", &[]).unwrap();
+                        e.b.ins().brif(deleted, exit, &[], next, &[]);
                     }
                     Op::Broadcast(name, wait) => {
                         let name = e.expr(name);
@@ -363,10 +417,21 @@ struct Emitter<'a> {
     vm: ir::Value,
     vars: ir::Value,
     lists: ir::Value,
+    local_vars: ir::Value,
+    local_lists: ir::Value,
+    variable_local: Vec<bool>,
+    list_local: Vec<bool>,
     pointer: ir::Type,
     funcs: HashMap<&'static str, ir::FuncRef>,
 }
 impl Emitter<'_> {
+    fn variable_base(&self, slot: usize) -> ir::Value {
+        if self.variable_local[slot] {
+            self.local_vars
+        } else {
+            self.vars
+        }
+    }
     fn load(&mut self, ty: ir::Type, offset: usize) -> ir::Value {
         self.b
             .ins()
@@ -461,12 +526,17 @@ impl Emitter<'_> {
     }
     fn list(&mut self, op: u32, slot: usize, index: ir::Value, item: ir::Value) -> ir::Value {
         use crate::lists::ListView;
+        let lists = if self.list_local[slot] {
+            self.local_lists
+        } else {
+            self.lists
+        };
         let base = slot * std::mem::size_of::<ListView>();
         if op == 6 {
             let len = self.b.ins().load(
                 self.pointer,
                 ir::MemFlags::trusted(),
-                self.lists,
+                lists,
                 (base + offset_of!(ListView, len)) as i32,
             );
             let len = self.b.ins().fcvt_from_uint(types::F64, len);
@@ -490,7 +560,7 @@ impl Emitter<'_> {
         let len = self.b.ins().load(
             self.pointer,
             ir::MemFlags::trusted(),
-            self.lists,
+            lists,
             (base + offset_of!(ListView, len)) as i32,
         );
         let len = self.b.ins().fcvt_from_uint(types::F64, len);
@@ -512,7 +582,7 @@ impl Emitter<'_> {
         let data = self.b.ins().load(
             self.pointer,
             ir::MemFlags::trusted(),
-            self.lists,
+            lists,
             (base + offset_of!(ListView, data)) as i32,
         );
         let address = self.b.ins().iadd(data, at);
@@ -602,12 +672,15 @@ impl Emitter<'_> {
     fn expr(&mut self, expr: &Expr) -> ir::Value {
         match expr {
             Expr::Constant(bits) => self.b.ins().iconst(types::I64, *bits as i64),
-            Expr::Variable(slot) => self.b.ins().load(
-                types::I64,
-                ir::MemFlags::trusted(),
-                self.vars,
-                (*slot * 8) as i32,
-            ),
+            Expr::Variable(slot) => {
+                let vars = self.variable_base(*slot);
+                self.b.ins().load(
+                    types::I64,
+                    ir::MemFlags::trusted(),
+                    vars,
+                    (*slot * 8) as i32,
+                )
+            }
             Expr::Argument(slot) => {
                 let args = self.load(self.pointer, offset_of!(JitState, args));
                 self.b.ins().load(
