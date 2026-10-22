@@ -23,6 +23,10 @@ In `interactive.sb3`, arrow keys move the sprite, clicking its visible pixels ch
 
 ## Running projects
 
+The Scratch username reporter returns `Player1` by default. Override it with
+`--username "YourName"`, for example `msbjit game.sb3 --turbo --username "Alex"`.
+Library callers can set `RuntimeOptions.username`.
+
 ```sh
 cargo run --release -- examples/counter.json --turbo --json
 cargo run --release -- examples/demo.sb3 --seconds 5

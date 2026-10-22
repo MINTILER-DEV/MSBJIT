@@ -434,6 +434,7 @@ impl Lower<'_> {
                 "sensing_mousey" => 8,
                 "sensing_mousedown" => 9,
                 "sensing_dayssince2000" => 10,
+                "sensing_username" => 11,
                 "sensing_touchingobjectmenu" => {
                     return Ok(
                         self.constant(ScratchValue::String(b.field("TOUCHINGOBJECTMENU")?.into()))

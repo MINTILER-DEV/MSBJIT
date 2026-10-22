@@ -24,6 +24,9 @@ struct Args {
     /// Remove normal loop frame boundaries (explicit waits still wait)
     #[arg(long)]
     turbo: bool,
+    /// Username returned by Scratch's username reporter
+    #[arg(long, default_value = runtime::DEFAULT_USERNAME)]
+    username: String,
     /// Stop execution after this many seconds
     #[arg(long)]
     seconds: Option<f64>,
@@ -102,6 +105,7 @@ fn main() -> Result<()> {
     let running = spawn(
         project.clone(),
         RuntimeOptions {
+            username: args.username,
             turbo: args.turbo,
             tick_hz: args.tick_hz,
             warp_timeout: Duration::from_millis(args.watchdog_ms),

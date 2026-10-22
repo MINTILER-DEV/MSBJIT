@@ -23,8 +23,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub const DEFAULT_USERNAME: &str = "Player1";
+
 #[derive(Debug, Clone)]
 pub struct RuntimeOptions {
+    pub username: String,
     pub turbo: bool,
     pub tick_hz: f64,
     pub warp_timeout: Duration,
@@ -34,6 +37,7 @@ pub struct RuntimeOptions {
 impl Default for RuntimeOptions {
     fn default() -> Self {
         Self {
+            username: DEFAULT_USERNAME.into(),
             turbo: false,
             tick_hz: 30.0,
             warp_timeout: Duration::from_millis(500),
@@ -1103,6 +1107,12 @@ pub(crate) extern "C" fn rt_unary(vm: &mut Vm, op: u32, a: u64) -> u64 {
     vm.program.values.encode(result)
 }
 pub(crate) extern "C" fn rt_state(vm: &mut Vm, field: u32) -> u64 {
+    if field == 11 {
+        return vm
+            .program
+            .values
+            .encode(ScratchValue::String(vm.options.username.clone()));
+    }
     if field == 10 {
         let seconds = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
