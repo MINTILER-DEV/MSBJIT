@@ -43,6 +43,8 @@ Use `--display` to request a window explicitly, including for asset-free JSON pr
 
 `--seconds` sets an execution limit and, when streaming, a host duration. `--max-steps` caps executed IR instructions. `--tick-hz` defaults to 30. `--turbo` removes loop frame boundaries without removing explicit waits. `--watchdog-ms` may lower the warp execution budget from its maximum of 500 ms. `--json` prints final variables, sprite state, captured say/think messages, and execution statistics. Compilation time is excluded from execution statistics.
 
+The loader accepts up to 256 MiB of decompressed project JSON by default, for both `.sb3` archives and standalone `.json` files. Compressed archive size can be much smaller than its JSON. For larger projects, pass `--max-project-mib 512` (1–4096 MiB supported). This changes the JSON limit; costume asset limits remain separate. Large list data also requires memory for its parsed and runtime representations.
+
 ## Execution model
 
 The loader reads bounded ZIP entries directly without extracting them. Variables resolve by Scratch ID with stage fallback. Block graphs are checked for missing links, cycles, and excessive depth. Active unsupported commands/reporters and event hats produce errors with block context; detached workspace stacks are ignored.

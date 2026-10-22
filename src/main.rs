@@ -1,7 +1,7 @@
 use anyhow::{Result, ensure};
 use clap::Parser;
 use msbjit::{
-    project::Project,
+    project::{DEFAULT_MAX_PROJECT_MIB, Project},
     runtime::{self, RuntimeOptions},
 };
 use std::{
@@ -18,6 +18,9 @@ use std::{
 struct Args {
     /// Scratch .sb3 archive or standalone project.json
     project: PathBuf,
+    /// Maximum decompressed project.json size in MiB (costume limits are separate)
+    #[arg(long, default_value_t = DEFAULT_MAX_PROJECT_MIB, value_parser = clap::value_parser!(u64).range(1..=4096))]
+    max_project_mib: u64,
     /// Remove normal loop frame boundaries (explicit waits still wait)
     #[arg(long)]
     turbo: bool,
@@ -75,7 +78,10 @@ fn main() -> Result<()> {
         args.serve.is_none(),
         "browser streaming requires: cargo run --features streaming -- <project> --serve 127.0.0.1:8080"
     );
-    let project = Arc::new(Project::load(&args.project)?);
+    let project = Arc::new(Project::load_with_max_json_bytes(
+        &args.project,
+        args.max_project_mib * 1024 * 1024,
+    )?);
     let display = args.display
         || (cfg!(feature = "desktop")
             && !args.headless

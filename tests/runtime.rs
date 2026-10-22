@@ -272,6 +272,27 @@ fn scratch_coercions() {
 }
 
 #[test]
+fn compact_variable_and_list_reporters_load_and_execute() {
+    let p: Project = serde_json::from_value(json!({"targets":[{
+        "name":"Stage","isStage":true,"variables":{"n":["n",0],"s":["s","hello"]},
+        "lists":{"letters":["letters",["a","b"]]},
+        "blocks":{
+            "hat":{"opcode":"event_whenflagclicked","topLevel":true,"next":"set"},
+            "set":{"opcode":"data_setvariableto","fields":{"VARIABLE":["n","n"]},"inputs":{"VALUE":[2,"variable"]},"next":"copy"},
+            "copy":{"opcode":"data_setvariableto","fields":{"VARIABLE":["s","s"]},"inputs":{"VALUE":[2,"list"]}},
+            "variable":[12,"s","s",20,30],
+            "list":[13,"letters","letters"]
+        }
+    }]})).unwrap();
+    let report = runtime::spawn(Arc::new(p), RuntimeOptions::default())
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(value(&report, "n"), &ScratchValue::String("hello".into()));
+    assert_eq!(value(&report, "s"), &ScratchValue::String("ab".into()));
+}
+
+#[test]
 fn nonwarp_callees_inherit_warp_mode() {
     let r = run(
         json!({
