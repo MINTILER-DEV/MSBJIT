@@ -1,6 +1,7 @@
 mod audio;
 #[cfg(feature = "desktop")]
 pub mod desktop;
+pub mod effects;
 pub mod input;
 mod ir;
 mod jit;

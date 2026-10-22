@@ -681,6 +681,16 @@ impl Lower<'_> {
             "looks_hide" => Op::Action(10, self.zero(), self.zero()),
             "looks_setsizeto" => Op::Action(11, self.expr_input(b, "SIZE")?, self.zero()),
             "looks_changesizeby" => Op::Action(12, self.expr_input(b, "CHANGE")?, self.zero()),
+            "looks_seteffectto" | "looks_changeeffectby" => {
+                let effect = self.constant(ScratchValue::String(b.field("EFFECT")?.into()));
+                let change = b.opcode == "looks_changeeffectby";
+                Op::Action(
+                    if change { 31 } else { 30 },
+                    effect,
+                    self.expr_input(b, if change { "CHANGE" } else { "VALUE" })?,
+                )
+            }
+            "looks_cleargraphiceffects" => Op::Action(32, self.zero(), self.zero()),
             "looks_say" | "looks_think" => {
                 Op::Action(13, self.expr_input(b, "MESSAGE")?, self.zero())
             }

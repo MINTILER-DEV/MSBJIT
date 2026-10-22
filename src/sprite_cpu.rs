@@ -10,6 +10,7 @@ pub(crate) struct CostumePixels {
     pub rgba: Vec<u8>,
     pub center: [f64; 2],
     pub resolution: f64,
+    pub svg: bool,
     bounds: Option<[f64; 4]>,
 }
 
@@ -36,6 +37,7 @@ impl CostumePixels {
             rgba,
             center,
             resolution,
+            svg: false,
             bounds: opaque.then_some(bounds),
         }
     }
@@ -62,6 +64,9 @@ impl CostumePixels {
         Some((scale, sin, cos, flip))
     }
     pub fn world_bounds(&self, state: &SpriteState) -> Option<[f64; 4]> {
+        if state.effects.changes_shape() {
+            return self.effect_bounds(state);
+        }
         let [left, top, right, bottom] = self.bounds?;
         let (scale, sin, cos, flip) = self.transform(state)?;
         let mut bounds = [
@@ -80,6 +85,83 @@ impl CostumePixels {
             bounds[3] = bounds[3].max(y);
         }
         Some(bounds)
+    }
+    fn linear(&self, state: &SpriteState) -> bool {
+        self.svg
+            && (state.effects.changes_shape()
+                || state.direction % 90.0 != 0.0
+                || (state.size - 100.0).abs() >= 0.001)
+    }
+    fn sample(&self, uv: [f64; 2], linear: bool) -> [f64; 4] {
+        if !uv.into_iter().all(f64::is_finite) {
+            return [0.0; 4];
+        }
+        let read = |x: f64, y: f64| {
+            let x = x.clamp(0.0, (self.width - 1) as f64) as usize;
+            let y = y.clamp(0.0, (self.height - 1) as f64) as usize;
+            std::array::from_fn::<_, 4, _>(|c| {
+                self.rgba[(y * self.width + x) * 4 + c] as f64 / 255.0
+            })
+        };
+        if !linear {
+            return read(
+                (uv[0] * self.width as f64).floor(),
+                (uv[1] * self.height as f64).floor(),
+            );
+        }
+        let (x, y) = (
+            uv[0] * self.width as f64 - 0.5,
+            uv[1] * self.height as f64 - 0.5,
+        );
+        let (fx, fy) = (x - x.floor(), y - y.floor());
+        let (a, b, c, d) = (
+            read(x.floor(), y.floor()),
+            read(x.floor() + 1.0, y.floor()),
+            read(x.floor(), y.floor() + 1.0),
+            read(x.floor() + 1.0, y.floor() + 1.0),
+        );
+        std::array::from_fn(|i| {
+            (a[i] * (1.0 - fx) + b[i] * fx) * (1.0 - fy) + (c[i] * (1.0 - fx) + d[i] * fx) * fy
+        })
+    }
+    fn effect_bounds(&self, state: &SpriteState) -> Option<[f64; 4]> {
+        let (scale, sin, cos, flip) = self.transform(state)?;
+        let mut bounds = [
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        let size = [
+            self.width as f64 / self.resolution,
+            self.height as f64 / self.resolution,
+        ];
+        let opaque = |x: usize, y: usize| {
+            let uv = state.effects.point(
+                [
+                    (x as f64 + 0.5) / self.width as f64,
+                    (y as f64 + 0.5) / self.height as f64,
+                ],
+                size,
+            );
+            self.sample(uv, self.linear(state))[3] > 0.0
+        };
+        for y in 0..self.height {
+            let Some(left) = (0..self.width).find(|&x| opaque(x, y)) else {
+                continue;
+            };
+            let right = (left..self.width).rfind(|&x| opaque(x, y)).unwrap() + 1;
+            for (px, py) in [(left, y), (left, y + 1), (right, y), (right, y + 1)] {
+                let x = (px as f64 - self.center[0]) * scale * flip;
+                let y = (self.center[1] - py as f64) * scale;
+                let (x, y) = (state.x + x * cos - y * sin, state.y + x * sin + y * cos);
+                bounds[0] = bounds[0].min(x);
+                bounds[1] = bounds[1].min(y);
+                bounds[2] = bounds[2].max(x);
+                bounds[3] = bounds[3].max(y);
+            }
+        }
+        bounds[0].is_finite().then_some(bounds)
     }
     pub fn touching_edge(&self, state: &SpriteState) -> bool {
         self.world_bounds(state)
@@ -111,12 +193,20 @@ impl CostumePixels {
                 if px < 0.0 || py < 0.0 || px >= self.width as f64 || py >= self.height as f64 {
                     continue;
                 }
-                let source = &self.rgba[(py as usize * self.width + px as usize) * 4..][..4];
+                let uv = state.effects.point(
+                    [px / self.width as f64, py / self.height as f64],
+                    [
+                        self.width as f64 / self.resolution,
+                        self.height as f64 / self.resolution,
+                    ],
+                );
+                let source = state.effects.color(self.sample(uv, self.linear(state)));
                 let target = &mut canvas.pixels[(y * WIDTH + x) * 4..][..4];
                 for channel in 0..4 {
-                    target[channel] = (source[channel] as u16
-                        + (target[channel] as u16 * (255 - source[3] as u16) + 127) / 255)
-                        .min(255) as u8;
+                    target[channel] = (source[channel] * 255.0
+                        + target[channel] as f64 * (1.0 - source[3]))
+                        .round_ties_even()
+                        .clamp(0.0, 255.0) as u8;
                 }
             }
         }
@@ -129,6 +219,7 @@ mod tests {
     use super::*;
     fn state() -> SpriteState {
         SpriteState {
+            effects: Default::default(),
             name: "sprite".into(),
             is_stage: false,
             x: 0.0,

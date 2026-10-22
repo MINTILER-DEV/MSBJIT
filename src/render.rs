@@ -12,14 +12,47 @@ const ROW: u32 = 2048;
 struct Vertex {
     position: [f32; 2],
     uv: [f32; 2],
+    shape: [f32; 4],
+    color: [f32; 4],
+    skin_size: [f32; 2],
+    effect_mask: u32,
 }
 struct Costume {
     bind: wgpu::BindGroup,
+    nearest_bind: wgpu::BindGroup,
+    svg: bool,
     width: f64,
     height: f64,
     center: [f64; 2],
     resolution: f64,
     alpha: Vec<u8>,
+}
+impl Costume {
+    fn nearest(&self, state: &SpriteState) -> bool {
+        !self.svg
+            || (!state.effects.changes_shape()
+                && state.direction % 90.0 == 0.0
+                && (state.size - 100.0).abs() < 0.001)
+    }
+    fn opaque(&self, uv: [f64; 2], state: &SpriteState) -> bool {
+        if !uv.into_iter().all(f64::is_finite) {
+            return false;
+        }
+        let read = |x: f64, y: f64| {
+            let x = x.clamp(0.0, self.width - 1.0) as usize;
+            let y = y.clamp(0.0, self.height - 1.0) as usize;
+            self.alpha[y * self.width as usize + x] > 0
+        };
+        if self.nearest(state) {
+            return read((uv[0] * self.width).floor(), (uv[1] * self.height).floor());
+        }
+        let (x, y) = (uv[0] * self.width - 0.5, uv[1] * self.height - 0.5);
+        let (fx, fy) = (x - x.floor(), y - y.floor());
+        read(x.floor(), y.floor()) && (1.0 - fx) * (1.0 - fy) > 0.0
+            || read(x.floor() + 1.0, y.floor()) && fx * (1.0 - fy) > 0.0
+            || read(x.floor(), y.floor() + 1.0) && (1.0 - fx) * fy > 0.0
+            || read(x.floor() + 1.0, y.floor() + 1.0) && fx * fy > 0.0
+    }
 }
 pub(crate) struct Renderer {
     device: wgpu::Device,
@@ -115,7 +148,7 @@ impl Renderer {
                 buffers: &[wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<Vertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0=>Float32x2,1=>Float32x2],
+                    attributes: &wgpu::vertex_attr_array![0=>Float32x2,1=>Float32x2,2=>Float32x4,3=>Float32x4,4=>Float32x2,5=>Uint32],
                 }],
             },
             primitive: Default::default(),
@@ -139,6 +172,7 @@ impl Renderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
         let pen_texture = device.create_texture_with_data(
             &queue,
             &wgpu::TextureDescriptor {
@@ -229,8 +263,24 @@ impl Renderer {
                         },
                     ],
                 });
+                let nearest_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&nearest_sampler),
+                        },
+                    ],
+                });
                 list.push(Costume {
                     bind,
+                    nearest_bind,
+                    svg: costume.md5ext.to_ascii_lowercase().ends_with(".svg"),
                     width: width as f64,
                     height: height as f64,
                     center: [costume.rotation_center_x, costume.rotation_center_y],
@@ -299,7 +349,7 @@ impl Renderer {
             if state.is_stage {
                 return Some(id);
             }
-            if !state.visible {
+            if !state.visible || state.effects.ghost >= 100.0 {
                 continue;
             }
             let Some(costume) = self.costumes[id].get(state.costume) else {
@@ -323,12 +373,17 @@ impl Renderer {
             };
             let px = (dx * cos + dy * sin) / scale / flip + costume.center[0];
             let py = costume.center[1] - (-dx * sin + dy * cos) / scale;
-            if px >= 0.0
-                && py >= 0.0
-                && px < costume.width
-                && py < costume.height
-                && costume.alpha[py as usize * costume.width as usize + px as usize] > 0
-            {
+            if px < 0.0 || py < 0.0 || px >= costume.width || py >= costume.height {
+                continue;
+            }
+            let uv = state.effects.point(
+                [px / costume.width, py / costume.height],
+                [
+                    costume.width / costume.resolution,
+                    costume.height / costume.resolution,
+                ],
+            );
+            if costume.opaque(uv, state) {
                 return Some(id);
             }
         }
@@ -377,6 +432,10 @@ impl Renderer {
             vertices.push(Vertex {
                 position: [u * 2.0 - 1.0, 1.0 - v * 2.0],
                 uv: [u, v],
+                shape: [0.0, 1.0, 0.0, 0.0],
+                color: [1.0, 0.0, 1.0, 0.0],
+                skin_size: [480.0, 360.0],
+                effect_mask: 0,
             });
         }
         let mut draws = vec![];
@@ -389,6 +448,7 @@ impl Renderer {
                 continue;
             };
             let start = vertices.len() as u32;
+            let (shape, color) = state.effects.uniforms();
             let scale = if state.is_stage {
                 1.0
             } else {
@@ -413,6 +473,13 @@ impl Renderer {
                 vertices.push(Vertex {
                     position: [(px / 240.0) as f32, (py / 180.0) as f32],
                     uv: [u as f32, v as f32],
+                    shape,
+                    color,
+                    skin_size: [
+                        (costume.width / costume.resolution) as f32,
+                        (costume.height / costume.resolution) as f32,
+                    ],
+                    effect_mask: state.effects.mask(),
                 });
             }
             draws.push((id, state.costume, start));
@@ -447,7 +514,17 @@ impl Renderer {
                     pass.draw(0..6, 0..1);
                     pen_drawn = true;
                 }
-                pass.set_bind_group(0, &self.costumes[id][costume].bind, &[]);
+                let c = &self.costumes[id][costume];
+                let state = &states[id];
+                pass.set_bind_group(
+                    0,
+                    if c.nearest(state) {
+                        &c.nearest_bind
+                    } else {
+                        &c.bind
+                    },
+                    &[],
+                );
                 pass.draw(start..start + 6, 0..1);
             }
             if !pen_drawn {

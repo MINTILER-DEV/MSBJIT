@@ -48,6 +48,7 @@ impl Default for RuntimeOptions {
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct SpriteState {
+    pub effects: crate::effects::GraphicEffects,
     pub name: String,
     pub is_stage: bool,
     pub x: f64,
@@ -59,6 +60,7 @@ pub struct SpriteState {
     pub rotation_style: String,
 }
 struct AtomicSprite {
+    effects: [AtomicU64; 7],
     x: AtomicU64,
     y: AtomicU64,
     direction: AtomicU64,
@@ -86,6 +88,7 @@ impl SharedScene {
                 .targets
                 .iter()
                 .map(|t| AtomicSprite {
+                    effects: std::array::from_fn(|_| AtomicU64::new(0)),
                     x: AtomicU64::new(t.x.to_bits()),
                     y: AtomicU64::new(t.y.to_bits()),
                     direction: AtomicU64::new(t.direction.to_bits()),
@@ -105,6 +108,9 @@ impl SharedScene {
             .iter()
             .zip(&project.targets)
             .map(|(s, t)| SpriteState {
+                effects: crate::effects::GraphicEffects::from_values(std::array::from_fn(|i| {
+                    f64::from_bits(s.effects[i].load(Ordering::Relaxed))
+                })),
                 name: t.name.clone(),
                 is_stage: t.is_stage,
                 x: f64::from_bits(s.x.load(Ordering::Relaxed)),
@@ -389,9 +395,20 @@ impl Vm {
                     .as_nanos() as u64,
         }
     }
+    fn clear_effects(&mut self) {
+        for s in &mut self.sprites {
+            s.effects = Default::default();
+        }
+        for id in 0..self.sprites.len() {
+            self.publish_sprite(id);
+        }
+    }
     fn publish_sprite(&self, id: usize) {
         let s = &self.sprites[id];
         let a = &self.shared.sprites[id];
+        for (value, atomic) in s.effects.values().into_iter().zip(&a.effects) {
+            atomic.store(value.to_bits(), Ordering::Relaxed);
+        }
         a.x.store(s.x.to_bits(), Ordering::Relaxed);
         a.y.store(s.y.to_bits(), Ordering::Relaxed);
         a.direction.store(s.direction.to_bits(), Ordering::Relaxed);
@@ -465,6 +482,7 @@ impl Vm {
                 if matches!(event, InputEvent::Stop | InputEvent::Flag) {
                     fibers.clear();
                     self.audio.stop();
+                    self.clear_effects();
                 }
                 if matches!(event, InputEvent::Flag) {
                     self.timer = Instant::now();
@@ -584,6 +602,7 @@ impl Vm {
                         }
                         Event::StopAll => {
                             self.audio.stop();
+                            self.clear_effects();
                             for fiber in &mut fibers {
                                 fiber.done = true;
                             }
@@ -714,13 +733,15 @@ impl Vm {
                 self.costume_bytes = 0;
             }
             self.costume_bytes += rgba.len();
-            let pixels = Arc::new(CostumePixels::new(
+            let mut pixels = CostumePixels::new(
                 w,
                 h,
                 rgba,
                 [costume.rotation_center_x, costume.rotation_center_y],
                 costume.bitmap_resolution,
-            ));
+            );
+            pixels.svg = costume.md5ext.to_ascii_lowercase().ends_with(".svg");
+            let pixels = Arc::new(pixels);
             self.costume_pixels.insert(key, pixels.clone());
             Ok(Some(pixels))
         }
@@ -1240,6 +1261,8 @@ pub(crate) extern "C" fn rt_action(vm: &mut Vm, op: u32, a: u64, b: u64) {
         23 => vm.pens[target].parameter(&value.text(), m, true),
         24 => vm.pens[target].set_color(&value),
         25 => vm.pens[target].size = (vm.pens[target].size + n).clamp(1.0, 1200.0),
+        30 | 31 => s.effects.update(&value.text(), m, op == 31),
+        32 => s.effects = Default::default(),
         _ => {}
     }
     if matches!(op, 0..=5) && vm.pens[target].down && old_position != (s.x, s.y) {
