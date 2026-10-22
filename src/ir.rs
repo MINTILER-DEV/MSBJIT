@@ -312,6 +312,25 @@ impl Lower<'_> {
             .with_context(|| format!("unknown list {id}"))
     }
     fn input<'a>(&self, b: &'a Block, name: &str) -> Result<&'a Value> {
+        let empty = b.inputs.get(name).is_none_or(|input| {
+            input.get(1).is_none_or(Value::is_null) && input.get(2).is_none_or(Value::is_null)
+        });
+        let boolean = match b.opcode.as_str() {
+            "operator_and" | "operator_or" => matches!(name, "OPERAND1" | "OPERAND2"),
+            "operator_not" => name == "OPERAND",
+            "control_if"
+            | "control_if_else"
+            | "control_wait_until"
+            | "control_repeat_until"
+            | "control_while" => name == "CONDITION",
+            _ => false,
+        };
+        if empty && boolean {
+            // Scratch allows unplugged Boolean sockets. A numeric zero has
+            // the same false value throughout the native Boolean coercions.
+            static FALSE: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+            return Ok(FALSE.get_or_init(|| serde_json::json!([4, "0"])));
+        }
         let input = b
             .inputs
             .get(name)

@@ -30,6 +30,40 @@ fn value<'a>(report: &'a RunReport, id: &str) -> &'a ScratchValue {
     &report.variables.iter().find(|v| v.id == id).unwrap().value
 }
 #[test]
+fn empty_boolean_sockets_coerce_to_false_in_reporters_and_conditions() {
+    for (opcode, inputs, expected) in [
+        ("operator_or", json!({"OPERAND1":[1,[4,"1"]]}), true),
+        ("operator_or", json!({}), false),
+        ("operator_and", json!({"OPERAND2":[1,[4,"1"]]}), false),
+        ("operator_not", json!({"OPERAND":[2,null]}), true),
+    ] {
+        let report = run(
+            json!({
+                "flag":{"opcode":"event_whenflagclicked","topLevel":true,"next":"save"},
+                "save":{"opcode":"data_setvariableto","fields":{"VARIABLE":["counter","n"]},"inputs":{"VALUE":[2,"test"]}},
+                "test":{"opcode":opcode,"inputs":inputs}
+            }),
+            true,
+        );
+        assert_eq!(
+            value(&report, "n"),
+            &ScratchValue::Boolean(expected),
+            "{opcode}"
+        );
+    }
+    let report = run(
+        json!({
+            "flag":{"opcode":"event_whenflagclicked","topLevel":true,"next":"if"},
+            "if":{"opcode":"control_if","inputs":{"SUBSTACK":[2,"wrong"]},"next":"ifelse"},
+            "wrong":{"opcode":"data_setvariableto","fields":{"VARIABLE":["counter","n"]},"inputs":{"VALUE":[1,[4,"999"]]}},
+            "ifelse":{"opcode":"control_if_else","inputs":{"CONDITION":[2,null],"SUBSTACK":[2,"wrong"],"SUBSTACK2":[2,"right"]}},
+            "right":{"opcode":"data_changevariableby","fields":{"VARIABLE":["counter","n"]},"inputs":{"VALUE":[1,[4,"10"]]}}
+        }),
+        true,
+    );
+    assert_eq!(value(&report, "n").to_number(), 10.0);
+}
+#[test]
 fn clones_snapshot_local_variables_and_lists_and_share_stage_data() {
     let p: Project = serde_json::from_value(json!({"targets":[
         {"name":"Stage","isStage":true,"variables":{"sum":["sum",0]},"lists":{"results":["results",[]]}},
