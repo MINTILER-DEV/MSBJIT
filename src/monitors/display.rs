@@ -229,7 +229,12 @@ impl Overlay {
             self.pixels = p.take();
             self.previous = monitors;
         }
-        for (dst, src) in rgba.chunks_exact_mut(4).zip(self.pixels.chunks_exact(4)) {
+        for (dst, src) in rgba
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(self.pixels.as_chunks::<4>().0.iter())
+        {
             let inv = 255 - src[3] as u32;
             for c in 0..3 {
                 dst[c] = (src[c] as u32 + (dst[c] as u32 * inv + 127) / 255).min(255) as u8;
@@ -359,7 +364,12 @@ mod tests {
         assert_eq!(pixel(15, 15), &[229, 240, 255, 255]);
         assert_eq!(pixel(15, 55), &[255, 140, 26, 255]);
         assert_eq!(pixel(200, 200), &[255; 4]);
-        assert!(rgba.chunks_exact(4).any(|p| p[..3] == [87, 94, 117]));
+        assert!(
+            rgba.as_chunks::<4>()
+                .0
+                .iter()
+                .any(|p| p[..3] == [87, 94, 117])
+        );
         if let Ok(path) = std::env::var("MSBJIT_MONITOR_CAPTURE") {
             image::save_buffer(path, &rgba, 480, 360, image::ColorType::Rgba8).unwrap();
         }
