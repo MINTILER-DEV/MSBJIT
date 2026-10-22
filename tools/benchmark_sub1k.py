@@ -13,7 +13,7 @@ from pathlib import Path
 import zipfile
 
 
-def fixture(source, destination, frames):
+def fixture(source, destination, frames, rot_x=None):
     if frames < 1 or source.resolve() == destination.resolve():
         raise ValueError("use positive frames and a separate output path")
     with zipfile.ZipFile(source) as archive:
@@ -24,6 +24,13 @@ def fixture(source, destination, frames):
             raise ValueError("expected one MAIN ENGINE forever loop")
         loops[0]["opcode"] = "control_repeat"
         loops[0]["inputs"]["TIMES"] = [1, [4, str(frames)]]
+        if rot_x is not None:
+            resets = [b for b in engine["blocks"].values()
+                      if b["opcode"] == "data_setvariableto"
+                      and b["fields"]["VARIABLE"][0] == "Camera: RotX"]
+            if len(resets) != 1:
+                raise ValueError("expected one camera RotX initializer")
+            resets[0]["inputs"]["VALUE"] = [1, [4, str(rot_x)]]
         with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as output:
             for entry in archive.infolist():
                 output.writestr(entry, json.dumps(project).encode() if entry.filename == "project.json"
@@ -35,5 +42,6 @@ if __name__ == "__main__":
     parser.add_argument("source", type=Path)
     parser.add_argument("destination", type=Path)
     parser.add_argument("--frames", type=int, default=30)
+    parser.add_argument("--rot-x", type=float, help="optional fixed camera pitch; quality is unchanged")
     args = parser.parse_args()
-    fixture(args.source, args.destination, args.frames)
+    fixture(args.source, args.destination, args.frames, args.rot_x)
