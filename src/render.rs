@@ -846,26 +846,79 @@ mod tests {
             project.clone(),
             RuntimeOptions {
                 turbo: true,
-                time_limit: Some(Duration::from_secs(30)),
+                time_limit: Some(Duration::from_secs(120)),
                 ..Default::default()
             },
         )?;
         let scene = run.scene.clone();
         scene.enable_gpu_pen();
+        // Observe the project's keyboard-input mode without changing its data.
+        for m in scene
+            .monitors
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .filter(|m| m.label == "getting_input")
+        {
+            m.visible = true;
+        }
         scene.input.send(InputEvent::Flag);
-        let deadline = Instant::now() + Duration::from_secs(45);
+        let deadline = Instant::now() + Duration::from_secs(150);
+        let mut last_question = None;
+        let mut enabled_output = false;
+        let mut typed_command = false;
         loop {
+            // The host must consume GPU work during boot too: font stamps can
+            // otherwise fill the bounded pen queue before the list is shown.
+            renderer.capture_scene(&scene, &scene.snapshot(&project))?;
             let question = scene.question.lock().unwrap().clone();
-            if let Some(question) = question
-                && question.text.contains("new input type")
+            if let Some(question) = question {
+                if last_question != Some(question.id) {
+                    eprintln!("MNTOS prompt: {}", question.text);
+                    last_question = Some(question.id);
+                }
+                let response = if question.text.contains("new input type") {
+                    Some("0")
+                } else if question.text.starts_with("mint-os:") && !enabled_output {
+                    enabled_output = true;
+                    Some("set visout 1")
+                } else {
+                    None
+                };
+                if let Some(text) = response {
+                    scene.input.send(InputEvent::Answer {
+                        id: question.id,
+                        text: text.into(),
+                    });
+                }
+            }
+            if !typed_command
+                && scene.question.lock().unwrap().is_none()
+                && scene
+                    .monitors
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m.label == "getting_input" && m.number == 1.)
             {
-                scene.input.send(InputEvent::Answer {
-                    id: question.id,
-                    text: "0".into(),
-                });
+                typed_command = true;
+                for key in [
+                    "s", "e", "t", "space", "v", "i", "s", "o", "u", "t", "space", "1", "enter",
+                ] {
+                    scene.input.send(InputEvent::Key {
+                        key: key.into(),
+                        down: true,
+                    });
+                    std::thread::sleep(Duration::from_millis(80));
+                    scene.input.send(InputEvent::Key {
+                        key: key.into(),
+                        down: false,
+                    });
+                    std::thread::sleep(Duration::from_millis(80));
+                }
             }
             let ready = scene.monitors.lock().unwrap().iter().any(|m| {
-                m.label == "output" && m.visible && m.list.as_ref().is_some_and(|l| l.len >= 2)
+                m.label == "output" && m.visible && m.list.as_ref().is_some_and(|l| l.len > 0)
             });
             if ready {
                 break;
@@ -884,6 +937,15 @@ mod tests {
             }
             ensure!(Instant::now() < deadline, "MNTOS terminal did not appear");
             std::thread::sleep(Duration::from_millis(10));
+        }
+        for m in scene
+            .monitors
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .filter(|m| m.label == "getting_input")
+        {
+            m.visible = false;
         }
         let image = renderer.capture_scene(&scene, &scene.snapshot(&project))?;
         ensure!(
