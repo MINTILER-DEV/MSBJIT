@@ -619,6 +619,82 @@ mod tests {
     use super::*;
     #[test]
     #[ignore = "requires a wgpu graphics adapter"]
+    fn all_graphic_effects_match_scratch_webgl_reference() -> Result<()> {
+        let mut p: Project = serde_json::from_value(serde_json::json!({"targets":[
+            {"name":"Stage","isStage":true},
+            {"name":"Sprite","costumes":[{"name":"pattern","md5ext":"skin.png","rotationCenterX":32,"rotationCenterY":32}]}
+        ]}))?;
+        p.assets.insert(
+            "skin.png".into(),
+            include_bytes!("../tests/fixtures/effects/skin.png").to_vec(),
+        );
+        let p = std::sync::Arc::new(p);
+        let report = crate::runtime::spawn(p.clone(), Default::default())?.join()?;
+        let mut states = report.sprites;
+        let mut renderer = pollster::block_on(Renderer::new(&p))?;
+        assert_eq!(renderer.hit_test(&states, -7.5, 24.5), Some(1));
+        states[1].effects.mosaic = 50.0;
+        assert_eq!(renderer.hit_test(&states, -7.5, 24.5), Some(0));
+        states[1].effects = crate::effects::GraphicEffects {
+            ghost: 100.0,
+            ..Default::default()
+        };
+        assert_eq!(renderer.hit_test(&states, -7.5, 24.5), Some(0));
+        states[1].effects.ghost = 99.0;
+        assert_eq!(renderer.hit_test(&states, -7.5, 24.5), Some(1));
+        let reference: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/effects/reference.json"))?;
+        for case in reference["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            states[1].effects =
+                crate::effects::GraphicEffects::from_values(std::array::from_fn(|i| {
+                    case["values"][i].as_f64().unwrap()
+                }));
+            let resolution = case["resolution"].as_f64().unwrap();
+            renderer.costumes[1][0].resolution = resolution;
+            renderer.costumes[1][0].svg = case["svg"].as_bool().unwrap_or(false);
+            states[1].size = 100.0 * resolution;
+            let rgba = renderer.capture(&states)?;
+            let expected = image::open(format!(
+                "{}/tests/fixtures/effects/{name}.png",
+                env!("CARGO_MANIFEST_DIR")
+            ))?
+            .to_rgba8();
+            let mut max = 0;
+            let mut bad = 0;
+            let mut total = 0u64;
+            let mut crop = Vec::new();
+            for y in 0..64 {
+                for x in 0..64 {
+                    let pixel = &rgba[((y + 148) * 480 + x + 208) * 4..][..4];
+                    crop.extend_from_slice(pixel);
+                    for (a, b) in pixel.iter().zip(expected.get_pixel(x as u32, y as u32).0) {
+                        let diff = a.abs_diff(b);
+                        max = max.max(diff);
+                        bad += usize::from(diff > 2);
+                        total += diff as u64;
+                    }
+                }
+            }
+            eprintln!("{name}: max {max}, channels >2 {bad}, total {total}");
+            if let Ok(dir) = std::env::var("MSBJIT_EFFECT_CAPTURE") {
+                image::save_buffer(
+                    format!("{dir}/{name}.png"),
+                    &crop,
+                    64,
+                    64,
+                    image::ColorType::Rgba8,
+                )?;
+            }
+            ensure!(
+                max <= 2,
+                "{name}: effect diverged from Scratch: max={max}, bad={bad}, total={total}"
+            );
+        }
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires a wgpu graphics adapter"]
     fn variable_monitors_composite_above_the_gpu_stage() -> Result<()> {
         let mut project = Project::load(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/demo.sb3"))?;
         for t in &mut project.targets {

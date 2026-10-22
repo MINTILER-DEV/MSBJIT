@@ -13,6 +13,7 @@ pub struct GraphicEffects {
     pub brightness: f64,
     pub ghost: f64,
 }
+
 impl GraphicEffects {
     pub(crate) fn values(self) -> [f64; 7] {
         [
@@ -188,5 +189,47 @@ impl GraphicEffects {
             rgb[2] * ghost,
             alpha * ghost,
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn coordinate_effects_match_scratch_renderer_reference() {
+        let reference: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/effects/reference.json")).unwrap();
+        for c in reference["cases"].as_array().unwrap() {
+            let values = std::array::from_fn(|i| c["values"][i].as_f64().unwrap());
+            let effects = GraphicEffects::from_values(values);
+            assert_eq!(effects.mask(), c["mask"].as_u64().unwrap() as u32);
+            let size = 64.0 / c["resolution"].as_f64().unwrap();
+            for point in c["points"].as_array().unwrap() {
+                if point["expected"][0].is_null() {
+                    continue;
+                } // Scratch's undefined center 0/0.
+                let result = effects.point(
+                    [
+                        point["uv"][0].as_f64().unwrap(),
+                        point["uv"][1].as_f64().unwrap(),
+                    ],
+                    [size; 2],
+                );
+                for (i, n) in result.into_iter().enumerate() {
+                    assert!(
+                        (n - point["expected"][i].as_f64().unwrap()).abs() < 2e-5,
+                        "{} point {point}: {result:?}",
+                        c["name"]
+                    );
+                }
+            }
+        }
+        // Color=200 is enabled even though its hue offset wraps back to zero.
+        let effects = GraphicEffects {
+            color: 200.0,
+            ..Default::default()
+        };
+        assert_eq!(effects.mask(), 1);
+        assert!(effects.color([0.0, 0.0, 0.0, 1.0])[0] > 0.05);
     }
 }

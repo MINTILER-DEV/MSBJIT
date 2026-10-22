@@ -217,6 +217,76 @@ impl CostumePixels {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn edge_sensing_uses_distorted_alpha_and_ignores_ghost() {
+        let mut rgba = vec![0; 16];
+        rgba[4..8].fill(255);
+        let pixels = CostumePixels::new(4, 1, rgba, [2.0, 0.0], 1.0);
+        let mut sprite = state();
+        sprite.x = 240.0;
+        assert!(!pixels.touching_edge(&sprite));
+        sprite.effects.mosaic = 50.0;
+        assert!(pixels.touching_edge(&sprite));
+        sprite.effects.ghost = 100.0;
+        assert!(pixels.touching_edge(&sprite));
+    }
+    #[cfg(feature = "graphics")]
+    #[test]
+    fn stamps_apply_all_effects_and_bitmap_resolution_like_scratch() -> anyhow::Result<()> {
+        let (w, h, rgba) = crate::render::decode(
+            "skin.png",
+            include_bytes!("../tests/fixtures/effects/skin.png"),
+        )?;
+        let reference: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/effects/reference.json"))?;
+        for case in reference["cases"].as_array().unwrap() {
+            let mut pixels = CostumePixels::new(
+                w,
+                h,
+                rgba.clone(),
+                [32.0, 32.0],
+                case["resolution"].as_f64().unwrap(),
+            );
+            pixels.svg = case["svg"].as_bool().unwrap_or(false);
+            let mut sprite = state();
+            sprite.effects =
+                crate::effects::GraphicEffects::from_values(std::array::from_fn(|i| {
+                    case["values"][i].as_f64().unwrap()
+                }));
+            sprite.size = 100.0 * pixels.resolution;
+            let mut canvas = PenCanvas::default();
+            pixels.stamp(&sprite, &mut canvas);
+            let expected = image::open(format!(
+                "{}/tests/fixtures/effects/{}.png",
+                env!("CARGO_MANIFEST_DIR"),
+                case["name"].as_str().unwrap()
+            ))?
+            .to_rgba8();
+            let mut max = 0;
+            for y in 0..64 {
+                for x in 0..64 {
+                    let i = ((y + 148) * 480 + x + 208) * 4;
+                    let p = canvas.pixels.get(i..i + 4).unwrap_or(&[0; 4]);
+                    for (c, want) in expected
+                        .get_pixel(x as u32, y as u32)
+                        .0
+                        .into_iter()
+                        .take(3)
+                        .enumerate()
+                    {
+                        let got = p[c].saturating_add(255 - p[3]);
+                        max = max.max(got.abs_diff(want));
+                    }
+                }
+            }
+            assert!(
+                max <= 2,
+                "{} stamp differs from Scratch: max={max}",
+                case["name"]
+            );
+        }
+        Ok(())
+    }
     fn state() -> SpriteState {
         SpriteState {
             effects: Default::default(),

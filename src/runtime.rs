@@ -400,15 +400,19 @@ impl Vm {
             s.effects = Default::default();
         }
         for id in 0..self.sprites.len() {
-            self.publish_sprite(id);
+            self.publish_effects(id);
         }
     }
-    fn publish_sprite(&self, id: usize) {
+    fn publish_effects(&self, id: usize) {
         let s = &self.sprites[id];
         let a = &self.shared.sprites[id];
         for (value, atomic) in s.effects.values().into_iter().zip(&a.effects) {
             atomic.store(value.to_bits(), Ordering::Relaxed);
         }
+    }
+    fn publish_sprite(&self, id: usize) {
+        let s = &self.sprites[id];
+        let a = &self.shared.sprites[id];
         a.x.store(s.x.to_bits(), Ordering::Relaxed);
         a.y.store(s.y.to_bits(), Ordering::Relaxed);
         a.direction.store(s.direction.to_bits(), Ordering::Relaxed);
@@ -1278,7 +1282,11 @@ pub(crate) extern "C" fn rt_action(vm: &mut Vm, op: u32, a: u64, b: u64) {
             s.direction = 180.0;
         }
     }
-    vm.publish_sprite(target);
+    if matches!(op, 30..=32) {
+        vm.publish_effects(target);
+    } else {
+        vm.publish_sprite(target);
+    }
 }
 
 #[cfg(test)]
