@@ -44,7 +44,7 @@ pub struct Target {
     pub name: String,
     #[serde(default)]
     pub is_stage: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_variables")]
     pub variables: BTreeMap<String, (String, ScratchValue)>,
     #[serde(default)]
     pub lists: BTreeMap<String, (String, Vec<ScratchValue>)>,
@@ -72,6 +72,32 @@ pub struct Target {
     pub layer_order: i32,
     #[serde(default = "rotation")]
     pub rotation_style: String,
+}
+fn deserialize_variables<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, (String, ScratchValue)>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Entry {
+        Local((String, ScratchValue)),
+        Cloud((String, ScratchValue, bool)),
+    }
+    let entries = BTreeMap::<String, Entry>::deserialize(deserializer)?;
+    Ok(entries
+        .into_iter()
+        .map(|(id, entry)| {
+            // Cloud declarations have an optional third boolean. Execution keeps
+            // their saved values locally; no Scratch cloud connection is made.
+            let pair = match entry {
+                Entry::Local(pair) => pair,
+                Entry::Cloud((name, value, _)) => (name, value),
+            };
+            (id, pair)
+        })
+        .collect())
 }
 fn direction() -> f64 {
     90.0
@@ -279,6 +305,28 @@ fn read_project_json(reader: impl Read, limit: u64) -> Result<Project> {
 mod tests {
     use super::*;
     use std::io::{Cursor, Write};
+
+    #[test]
+    fn cloud_variable_flags_preserve_names_values_and_validate_shape() {
+        let project: Project = serde_json::from_str(
+            r#"{"targets":[{"name":"Stage","isStage":true,"variables":{
+            "local":["score",7],"cloud":["cloud score","007",true],"false":["flag",false,false]
+        }}]}"#,
+        )
+        .unwrap();
+        let vars = &project.targets[0].variables;
+        assert_eq!(vars["local"], ("score".into(), ScratchValue::Number(7.0)));
+        assert_eq!(
+            vars["cloud"],
+            ("cloud score".into(), ScratchValue::String("007".into()))
+        );
+        assert_eq!(vars["false"], ("flag".into(), ScratchValue::Boolean(false)));
+        for entry in ["[\"score\"]", "[\"score\",0,123]", "[\"score\",0,true,0]"] {
+            let json =
+                format!(r#"{{"targets":[{{"name":"Stage","variables":{{"id":{entry}}}}}]}}"#);
+            assert!(serde_json::from_str::<Project>(&json).is_err(), "{entry}");
+        }
+    }
 
     #[test]
     fn large_plain_and_compressed_projects_use_the_new_default_limit() -> Result<()> {
