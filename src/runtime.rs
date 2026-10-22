@@ -26,6 +26,7 @@ use std::{
 pub const DEFAULT_USERNAME: &str = "Player1";
 pub const DEFAULT_LANGUAGE: &str = "English";
 pub(crate) const MAX_CLONES: usize = 300;
+const EVENT_BATCH: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct RuntimeOptions {
@@ -1411,7 +1412,7 @@ pub(crate) extern "C" fn rt_checkpoint(vm: &mut Vm, pc: u32) -> u32 {
         return 1;
     }
     let now = Instant::now();
-    if vm.pen.queued_bytes >= MAX_QUEUED_BYTES {
+    if vm.pen.queued_bytes >= MAX_QUEUED_BYTES || vm.events.len() >= EVENT_BATCH {
         return 1;
     }
     if vm.current.warp() {
@@ -1675,6 +1676,11 @@ pub(crate) extern "C" fn rt_broadcast(vm: &mut Vm, name: u64, wait: u32, next: u
         name: vm.value(name).text(),
         wait: wait != 0,
     });
+    // A native turbo/warp loop can enqueue thousands of broadcasts before a
+    // clock sample. Preserve its continuation and dispatch a bounded batch.
+    if vm.events.len() >= EVENT_BATCH {
+        vm.jit.budget = 0;
+    }
     vm.current.pc = next as usize;
     vm.jit.pc = next;
 }

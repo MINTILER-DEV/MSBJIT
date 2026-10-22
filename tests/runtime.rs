@@ -30,6 +30,31 @@ fn value<'a>(report: &'a RunReport, id: &str) -> &'a ScratchValue {
     &report.variables.iter().find(|v| v.id == id).unwrap().value
 }
 #[test]
+fn warp_broadcast_storm_dispatches_in_batches_without_losing_the_caller() {
+    let report = run(
+        json!({
+            "flag":{"opcode":"event_whenflagclicked","topLevel":true,"next":"call"},
+            "call":{"opcode":"procedures_call","mutation":{"proccode":"storm","argumentids":"[]"}},
+            "def":{"opcode":"procedures_definition","topLevel":true,"inputs":{"custom_block":[1,"proto"]},"next":"repeat"},
+            "proto":{"opcode":"procedures_prototype","mutation":{"proccode":"storm","argumentids":"[]","argumentnames":"[]","argumentdefaults":"[]","warp":"true"}},
+            "repeat":{"opcode":"control_repeat","inputs":{"TIMES":[1,[4,"10000"]],"SUBSTACK":[2,"broadcast"]}},
+            "broadcast":{"opcode":"event_broadcast","inputs":{"BROADCAST_INPUT":[1,[10,"ping"]]},"next":"increment"},
+            "increment":{"opcode":"data_changevariableby","fields":{"VARIABLE":["counter","n"]},"inputs":{"VALUE":[1,[4,"1"]]}},
+            "receiver":{"opcode":"event_whenbroadcastreceived","topLevel":true,"fields":{"BROADCAST_OPTION":["ping",null]},"next":"mark"},
+            "mark":{"opcode":"data_setvariableto","fields":{"VARIABLE":["text","s"]},"inputs":{"VALUE":[1,[10,"received"]]}}
+        }),
+        true,
+    );
+    assert!(!report.interrupted);
+    assert_eq!(value(&report, "n"), &ScratchValue::Number(10000.));
+    assert_eq!(
+        value(&report, "s"),
+        &ScratchValue::String("received".into())
+    );
+    assert!(report.yields > 1);
+}
+
+#[test]
 fn empty_boolean_sockets_coerce_to_false_in_reporters_and_conditions() {
     for (opcode, inputs, expected) in [
         ("operator_or", json!({"OPERAND1":[1,[4,"1"]]}), true),
