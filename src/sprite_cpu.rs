@@ -89,7 +89,9 @@ impl CostumePixels {
     fn linear(&self, state: &SpriteState) -> bool {
         self.svg
             && (state.effects.changes_shape()
-                || state.direction % 90.0 != 0.0
+                || (!state.is_stage
+                    && state.rotation_style == "all around"
+                    && state.direction % 90.0 != 0.0)
                 || (state.size - 100.0).abs() >= 0.001)
     }
     fn sample(&self, uv: [f64; 2], linear: bool) -> [f64; 4] {
@@ -217,6 +219,18 @@ impl CostumePixels {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn svg_sampling_respects_rotation_style_when_direction_is_not_axis_aligned() {
+        let mut pixels = CostumePixels::new(1, 1, vec![255; 4], [0.0, 0.0], 1.0);
+        pixels.svg = true;
+        let mut sprite = state();
+        sprite.direction = -45.0;
+        assert!(pixels.linear(&sprite));
+        sprite.rotation_style = "left-right".into();
+        assert!(!pixels.linear(&sprite));
+        sprite.effects.whirl = 10.0;
+        assert!(pixels.linear(&sprite));
+    }
     #[test]
     fn edge_sensing_uses_distorted_alpha_and_ignores_ghost() {
         let mut rgba = vec![0; 16];

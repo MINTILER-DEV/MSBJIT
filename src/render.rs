@@ -31,7 +31,9 @@ impl Costume {
     fn nearest(&self, state: &SpriteState) -> bool {
         !self.svg
             || (!state.effects.changes_shape()
-                && state.direction % 90.0 == 0.0
+                && (state.is_stage
+                    || state.rotation_style != "all around"
+                    || state.direction % 90.0 == 0.0)
                 && (state.size - 100.0).abs() < 0.001)
     }
     fn opaque(&self, uv: [f64; 2], state: &SpriteState) -> bool {
