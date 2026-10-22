@@ -205,7 +205,17 @@ impl NativeProgram {
                 numeric_constants: program
                     .constants
                     .iter()
-                    .map(|&bits| (bits as i64, program.values.decode(bits).to_number()))
+                    .map(|&bits| (bits as i64, program.values.to_number(bits)))
+                    .collect(),
+                comparison_constants: program
+                    .constants
+                    .iter()
+                    .filter_map(|&bits| {
+                        program
+                            .values
+                            .comparison_number(bits)
+                            .map(|n| (bits as i64, n))
+                    })
                     .collect(),
                 profile: profile_address,
                 pointer,
@@ -454,11 +464,25 @@ struct Emitter<'a> {
     variable_local: Vec<bool>,
     list_local: Vec<bool>,
     numeric_constants: HashMap<i64, f64>,
+    comparison_constants: HashMap<i64, f64>,
     pointer: ir::Type,
     funcs: HashMap<&'static str, (ir::FuncRef, usize)>,
     profile: Option<ir::Value>,
 }
 impl Emitter<'_> {
+    fn comparison_constant(&self, value: ir::Value) -> Option<f64> {
+        if let ir::ValueDef::Result(inst, _) = self.b.func.dfg.value_def(value)
+            && let ir::InstructionData::UnaryImm {
+                opcode: ir::Opcode::Iconst,
+                imm,
+                ..
+            } = self.b.func.dfg.insts[inst]
+        {
+            self.comparison_constants.get(&imm.bits()).copied()
+        } else {
+            None
+        }
+    }
     fn get_loop(&mut self, slot: usize) -> ir::Value {
         // Calls, returns, and scheduler resumption rebind this pointer to the
         // active procedure frame. Do not cache it across a custom-block call.
@@ -817,8 +841,21 @@ impl Emitter<'_> {
                     return self.boolean(result);
                 }
                 if (5..=7).contains(op) {
-                    let a_boxed = self.boxed(a);
-                    let b_boxed = self.boxed(b);
+                    // A nonempty numeric literal can compare natively against
+                    // an unboxed number. Keep original operands for the slow
+                    // path so whitespace and string/string ordering stay exact.
+                    let ca = self.comparison_constant(a);
+                    let cb = self.comparison_constant(b);
+                    let a_boxed = if ca.is_some() {
+                        self.b.ins().iconst(types::I8, 0)
+                    } else {
+                        self.boxed(a)
+                    };
+                    let b_boxed = if cb.is_some() {
+                        self.b.ins().iconst(types::I8, 0)
+                    } else {
+                        self.boxed(b)
+                    };
                     let boxed = self.b.ins().bor(a_boxed, b_boxed);
                     let slow = self.b.create_block();
                     let fast = self.b.create_block();
@@ -826,8 +863,16 @@ impl Emitter<'_> {
                     self.b.append_block_param(join, types::I64);
                     self.b.ins().brif(boxed, slow, &[], fast, &[]);
                     self.b.switch_to_block(fast);
-                    let na = self.raw_num(a);
-                    let nb = self.raw_num(b);
+                    let na = if let Some(n) = ca {
+                        self.b.ins().f64const(n)
+                    } else {
+                        self.raw_num(a)
+                    };
+                    let nb = if let Some(n) = cb {
+                        self.b.ins().f64const(n)
+                    } else {
+                        self.raw_num(b)
+                    };
                     let condition = match op {
                         5 => ir::condcodes::FloatCC::LessThan,
                         6 => ir::condcodes::FloatCC::Equal,

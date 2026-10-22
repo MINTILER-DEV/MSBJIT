@@ -587,6 +587,46 @@ fn constant_numeric_coercion_preserves_assignment_and_string_semantics() {
 }
 
 #[test]
+fn numeric_literal_comparisons_keep_whitespace_boolean_and_string_fallbacks() {
+    let samples = [
+        ScratchValue::Number(0.0),
+        ScratchValue::Number(16.0),
+        ScratchValue::Number(f64::NAN),
+        ScratchValue::Boolean(true),
+        ScratchValue::String(" ".into()),
+        ScratchValue::String("".into()),
+        ScratchValue::String("0x10".into()),
+        ScratchValue::String("FALSE".into()),
+    ];
+    for literal in ["0", "16", "0x10", " ", "false"] {
+        let right = ScratchValue::String(literal.into());
+        for left in &samples {
+            for (opcode, condition) in [
+                ("operator_lt", left.compare(&right).is_lt()),
+                ("operator_equals", left.compare(&right).is_eq()),
+                ("operator_gt", left.compare(&right).is_gt()),
+            ] {
+                let mut p = project(json!({
+                    "hat":{"opcode":"event_whenflagclicked","topLevel":true,"next":"save"},
+                    "save":{"opcode":"data_setvariableto","fields":{"VARIABLE":["counter","n"]},"inputs":{"VALUE":[2,"compare"]}},
+                    "compare":{"opcode":opcode,"inputs":{"OPERAND1":[3,[12,"text","s"],[10,""]],"OPERAND2":[1,[10,literal]]}}
+                }));
+                p.targets[0].variables.get_mut("s").unwrap().1 = left.clone();
+                let r = runtime::spawn(Arc::new(p), RuntimeOptions::default())
+                    .unwrap()
+                    .join()
+                    .unwrap();
+                assert_eq!(
+                    value(&r, "n"),
+                    &ScratchValue::Boolean(condition),
+                    "{left:?} {opcode} {right:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn recursive_procedure_loops_survive_calls_returns_and_scheduler_resumption() {
     let blocks = json!({
         "hat":{"opcode":"event_whenflagclicked","topLevel":true,"next":"rootLoop"},

@@ -1099,10 +1099,10 @@ pub(crate) extern "C" fn rt_checkpoint(vm: &mut Vm, pc: u32) -> u32 {
     0
 }
 pub(crate) extern "C" fn rt_number(vm: &mut Vm, value: u64) -> f64 {
-    vm.value(value).to_number()
+    vm.program.values.to_number(value)
 }
 pub(crate) extern "C" fn rt_bool(vm: &mut Vm, value: u64) -> u32 {
-    u32::from(vm.value(value).to_bool())
+    u32::from(vm.program.values.to_bool(value))
 }
 fn list_index(value: &ScratchValue, length: usize, random: &mut u64) -> Option<usize> {
     let index = match value {
@@ -1323,6 +1323,14 @@ pub(crate) extern "C" fn rt_stop(vm: &mut Vm, mode: u32) {
     }
 }
 pub(crate) extern "C" fn rt_binary(vm: &mut Vm, op: u32, a: u64, b: u64) -> u64 {
+    if (5..=7).contains(&op) {
+        let ordering = vm.program.values.compare(a, b);
+        return vm.program.values.encode(ScratchValue::Boolean(match op {
+            5 => ordering.is_lt(),
+            6 => ordering.is_eq(),
+            _ => ordering.is_gt(),
+        }));
+    }
     let a = vm.value(a);
     let b = vm.value(b);
     let result = match op {
@@ -1379,6 +1387,27 @@ pub(crate) extern "C" fn rt_binary(vm: &mut Vm, op: u32, a: u64, b: u64) -> u64 
     vm.program.values.encode(result)
 }
 pub(crate) extern "C" fn rt_unary(vm: &mut Vm, op: u32, a: u64) -> u64 {
+    if (2..=16).contains(&op) {
+        let n = vm.program.values.to_number(a);
+        return number(match op {
+            2 => (n + 0.5).floor(),
+            3 => n.abs(),
+            4 => n.floor(),
+            5 => n.ceil(),
+            6 => n.sqrt(),
+            7 => n.to_radians().sin(),
+            8 => n.to_radians().cos(),
+            9 => n.to_radians().tan(),
+            10 => n.asin().to_degrees(),
+            11 => n.acos().to_degrees(),
+            12 => n.atan().to_degrees(),
+            13 => n.ln(),
+            14 => n.log10(),
+            15 => n.exp(),
+            16 => 10f64.powf(n),
+            _ => unreachable!(),
+        });
+    }
     let a = vm.value(a);
     if op == 18 {
         let result = if a.text() == "_edge_" {
@@ -1397,29 +1426,11 @@ pub(crate) extern "C" fn rt_unary(vm: &mut Vm, op: u32, a: u64) -> u64 {
         };
         return vm.program.values.encode(ScratchValue::Boolean(touching));
     }
-    let n = a.to_number();
     let result = match op {
         0 => ScratchValue::Boolean(!a.to_bool()),
         1 => ScratchValue::Number(a.text().chars().count() as f64),
         17 => ScratchValue::Boolean(vm.input.key_down(&a.text())),
-        _ => ScratchValue::Number(match op {
-            2 => (n + 0.5).floor(),
-            3 => n.abs(),
-            4 => n.floor(),
-            5 => n.ceil(),
-            6 => n.sqrt(),
-            7 => n.to_radians().sin(),
-            8 => n.to_radians().cos(),
-            9 => n.to_radians().tan(),
-            10 => n.asin().to_degrees(),
-            11 => n.acos().to_degrees(),
-            12 => n.atan().to_degrees(),
-            13 => n.ln(),
-            14 => n.log10(),
-            15 => n.exp(),
-            16 => 10f64.powf(n),
-            _ => 0.0,
-        }),
+        _ => ScratchValue::Number(0.0),
     };
     vm.program.values.encode(result)
 }

@@ -1,6 +1,7 @@
 //! Scratch coercions and a compact ABI value. Numbers travel through JIT code as
 //! unboxed IEEE-754 bits; nonnumeric values use reserved quiet-NaN payloads.
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -86,10 +87,16 @@ pub(crate) fn number(n: f64) -> u64 {
 }
 #[derive(Default)]
 pub(crate) struct Values {
-    strings: Vec<Option<String>>,
+    strings: Vec<Option<InternedString>>,
     interned: HashMap<String, usize>,
     free: Vec<usize>,
     dirty: bool,
+}
+struct InternedString {
+    text: String,
+    // Empty/whitespace strings participate in lexical comparisons, while
+    // arithmetic converts them to zero. Invalid numeric strings do likewise.
+    comparison_number: Option<f64>,
 }
 impl Values {
     pub fn encode(&mut self, value: ScratchValue) -> u64 {
@@ -102,10 +109,18 @@ impl Values {
                 } else {
                     self.dirty = true;
                     let id = self.free.pop().unwrap_or(self.strings.len());
+                    let entry = InternedString {
+                        comparison_number: if s.trim().is_empty() {
+                            None
+                        } else {
+                            parse_number(&s)
+                        },
+                        text: s.clone(),
+                    };
                     if id == self.strings.len() {
-                        self.strings.push(Some(s.clone()));
+                        self.strings.push(Some(entry));
                     } else {
-                        self.strings[id] = Some(s.clone());
+                        self.strings[id] = Some(entry);
                     }
                     self.interned.insert(s, id);
                     id
@@ -120,10 +135,63 @@ impl Values {
                 self.strings[(value & 0xffff_ffff) as usize]
                     .as_ref()
                     .expect("live string handle")
+                    .text
                     .clone(),
             ),
             BOOL_TAG => ScratchValue::Boolean(value & 1 != 0),
             _ => ScratchValue::Number(f64::from_bits(value)),
+        }
+    }
+    fn string(&self, value: u64) -> &InternedString {
+        self.strings[(value & 0xffff_ffff) as usize]
+            .as_ref()
+            .expect("live string handle")
+    }
+    pub fn comparison_number(&self, value: u64) -> Option<f64> {
+        match value & 0xffff_0000_0000_0000 {
+            STRING_TAG => self.string(value).comparison_number,
+            BOOL_TAG => Some((value & 1) as f64),
+            _ => {
+                let n = f64::from_bits(value);
+                Some(if n.is_nan() { 0.0 } else { n })
+            }
+        }
+    }
+    pub fn to_number(&self, value: u64) -> f64 {
+        self.comparison_number(value).unwrap_or(0.0)
+    }
+    pub fn to_bool(&self, value: u64) -> bool {
+        match value & 0xffff_0000_0000_0000 {
+            STRING_TAG => {
+                let s = &self.string(value).text;
+                !s.is_empty() && s != "0" && !s.eq_ignore_ascii_case("false")
+            }
+            BOOL_TAG => value & 1 != 0,
+            _ => {
+                let n = f64::from_bits(value);
+                n != 0.0 && !n.is_nan()
+            }
+        }
+    }
+    fn text(&self, value: u64) -> Cow<'_, str> {
+        match value & 0xffff_0000_0000_0000 {
+            STRING_TAG => Cow::Borrowed(&self.string(value).text),
+            BOOL_TAG => Cow::Borrowed(if value & 1 != 0 { "true" } else { "false" }),
+            _ => Cow::Owned(f64::from_bits(value).to_string()),
+        }
+    }
+    pub fn compare(&self, a: u64, b: u64) -> std::cmp::Ordering {
+        if let (Some(a), Some(b)) = (self.comparison_number(a), self.comparison_number(b)) {
+            return a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal);
+        }
+        let a = self.text(a);
+        let b = self.text(b);
+        if a.is_ascii() && b.is_ascii() {
+            a.bytes()
+                .map(|c| c.to_ascii_lowercase())
+                .cmp(b.bytes().map(|c| c.to_ascii_lowercase()))
+        } else {
+            a.to_lowercase().cmp(&b.to_lowercase())
         }
     }
     pub fn collect(&mut self, roots: impl Iterator<Item = u64>) {
@@ -140,9 +208,82 @@ impl Values {
             if !live.contains(&id)
                 && let Some(s) = entry.take()
             {
-                self.interned.remove(&s);
+                self.interned.remove(&s.text);
                 self.free.push(id);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cached_coercions_and_borrowed_comparisons_match_scratch_values() {
+        let mut values = Values::default();
+        let mut samples: Vec<_> = [
+            "",
+            " ",
+            "\t\n",
+            "0",
+            "-0",
+            "0.0",
+            "0x10",
+            "0b11",
+            "0o17",
+            "-2.5",
+            "1e3",
+            "NaN",
+            "Infinity",
+            "-Infinity",
+            "false",
+            "FALSE",
+            "true",
+            "Stone",
+            "STONE",
+            "stoned",
+            "é",
+            "É",
+            "İ",
+            "i\u{307}",
+        ]
+        .into_iter()
+        .map(|s| ScratchValue::String(s.into()))
+        .collect();
+        samples.extend([ScratchValue::Boolean(false), ScratchValue::Boolean(true)]);
+        samples.extend(
+            [
+                0.0,
+                -0.0,
+                1.0,
+                -1.0,
+                16.0,
+                1e100,
+                f64::NAN,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+            ]
+            .map(ScratchValue::Number),
+        );
+        let encoded: Vec<_> = samples.iter().cloned().map(|s| values.encode(s)).collect();
+        for (i, a) in samples.iter().enumerate() {
+            assert_eq!(values.to_number(encoded[i]), a.to_number(), "{a:?}");
+            assert_eq!(values.to_bool(encoded[i]), a.to_bool(), "{a:?}");
+            for (j, b) in samples.iter().enumerate() {
+                assert_eq!(
+                    values.compare(encoded[i], encoded[j]),
+                    a.compare(b),
+                    "{a:?} vs {b:?}"
+                );
+            }
+        }
+        let mut values = Values::default();
+        let old = values.encode(ScratchValue::String("42".into()));
+        values.collect(std::iter::empty());
+        let reused = values.encode(ScratchValue::String("FALSE".into()));
+        assert_eq!(old, reused);
+        assert_eq!(values.to_number(reused), 0.0);
+        assert!(!values.to_bool(reused));
+        assert_eq!(values.decode(reused), ScratchValue::String("FALSE".into()));
     }
 }
