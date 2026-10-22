@@ -603,6 +603,15 @@ impl Lower<'_> {
                     self.zero(),
                 )
             }
+            "data_showlist" | "data_hidelist" => {
+                let slot = self.list_field(b)?;
+                let slot = self.constant(ScratchValue::Number(slot as f64));
+                Op::Action(
+                    if b.opcode == "data_showlist" { 45 } else { 46 },
+                    slot,
+                    self.zero(),
+                )
+            }
             "data_addtolist" => Op::List(
                 0,
                 self.list_field(b)?,

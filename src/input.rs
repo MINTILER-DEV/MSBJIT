@@ -30,6 +30,32 @@ pub enum InputEvent {
         slot: usize,
         value: f64,
     },
+    #[serde(skip)]
+    ListMutation {
+        slot: usize,
+        index: usize,
+        op: u8,
+        text: String,
+    },
+    MonitorText {
+        slot: usize,
+        revision: u64,
+        text: String,
+        #[serde(default)]
+        replace: bool,
+    },
+    MonitorKey {
+        slot: usize,
+        revision: u64,
+        key: String,
+        #[serde(default)]
+        shift: bool,
+    },
+    Wheel {
+        x: f64,
+        y: f64,
+        delta: f64,
+    },
     Flag,
     Stop,
     Release,
@@ -79,6 +105,20 @@ impl InputController {
     pub fn send(&self, event: InputEvent) {
         let mut pending = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let event = match event {
+            InputEvent::ListMutation {
+                slot,
+                index,
+                op,
+                mut text,
+            } => {
+                crate::monitors::truncate_text(&mut text);
+                InputEvent::ListMutation {
+                    slot,
+                    index,
+                    op,
+                    text,
+                }
+            }
             InputEvent::Answer { id, mut text } => {
                 if text.len() > 16384 {
                     let mut end = 16384;

@@ -830,6 +830,79 @@ pub(crate) fn decode(name: &str, data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "requires MSBJIT_MNTOS_PROJECT and a wgpu adapter"]
+    fn mntos_list_terminal_boots_and_renders() -> Result<()> {
+        use crate::{
+            input::InputEvent,
+            runtime::{self, RuntimeOptions},
+        };
+        use std::{
+            sync::Arc,
+            time::{Duration, Instant},
+        };
+        let project = Arc::new(Project::load(std::env::var("MSBJIT_MNTOS_PROJECT")?)?);
+        let mut renderer = pollster::block_on(Renderer::new(&project))?;
+        let run = runtime::spawn_interactive(
+            project.clone(),
+            RuntimeOptions {
+                turbo: true,
+                time_limit: Some(Duration::from_secs(30)),
+                ..Default::default()
+            },
+        )?;
+        let scene = run.scene.clone();
+        scene.enable_gpu_pen();
+        scene.input.send(InputEvent::Flag);
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            let question = scene.question.lock().unwrap().clone();
+            if let Some(question) = question
+                && question.text.contains("new input type")
+            {
+                scene.input.send(InputEvent::Answer {
+                    id: question.id,
+                    text: "0".into(),
+                });
+            }
+            let ready = scene.monitors.lock().unwrap().iter().any(|m| {
+                m.label == "output" && m.visible && m.list.as_ref().is_some_and(|l| l.len >= 2)
+            });
+            if ready {
+                break;
+            }
+            if run.is_finished() {
+                let report = run.join()?;
+                eprintln!(
+                    "output list: {:?}",
+                    report
+                        .lists
+                        .iter()
+                        .find(|l| l.name == "output")
+                        .map(|l| &l.items)
+                );
+                anyhow::bail!("MNTOS stopped before its list terminal appeared");
+            }
+            ensure!(Instant::now() < deadline, "MNTOS terminal did not appear");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let image = renderer.capture_scene(&scene, &scene.snapshot(&project))?;
+        ensure!(
+            image
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|p| p[..3] == [255, 102, 26]),
+            "terminal rows were not drawn"
+        );
+        if let Ok(path) = std::env::var("MSBJIT_MNTOS_CAPTURE") {
+            image::save_buffer(path, &image, WIDTH, HEIGHT, image::ColorType::Rgba8)?;
+        }
+        run.stop();
+        let report = run.join()?;
+        eprintln!("MNTOS terminal initialized: {} native steps", report.steps);
+        Ok(())
+    }
+    #[test]
     #[ignore = "requires a wgpu adapter"]
     fn gpu_pen_matches_cpu_capsules_and_stamp_order() -> Result<()> {
         use crate::{

@@ -7,9 +7,9 @@ const vm = require('node:vm');
 function player() {
   const handlers = {}, sent = [];
   const elements = {};
-  for (const name of ['stage', 'connect', 'flag', 'stop', 'status', 'question', 'question-label', 'answer']) {
+  for (const name of ['stage', 'connect', 'flag', 'stop', 'status', 'question', 'question-label', 'answer','list-editor','list-label','list-value','list-done']) {
     elements[name] = {
-      focus() {}, setPointerCapture() {},
+      focus() {}, select() {}, setPointerCapture() {},
       getBoundingClientRect: () => ({left: 100, top: 50, width: 960, height: 720}),
       addEventListener: (type, handler) => {handlers[`${name}:${type}`] = handler;}
     };
@@ -28,6 +28,27 @@ function player() {
   vm.runInContext('socket = {readyState: 1, send: record};', context);
   return {handlers, elements, sent, context};
 }
+
+test('list editor sends Unicode text and row navigation without guest key events',()=>{
+  const {context,elements,handlers,sent}=player();
+  vm.runInContext('showListEditor({slot:0,revision:1,index:3,label:"output",text:"<b>value</b>"})',context);
+  assert.equal(elements['list-label'].textContent,'output: item 4');
+  assert.equal(elements['list-value'].value,'<b>value</b>');
+  elements['list-value'].value='hello 猫'; elements['list-value'].oninput();
+  handlers['list-value:keydown']({key:'Enter',shiftKey:true,preventDefault(){}});
+  elements['list-done'].onclick();
+  assert.deepEqual(sent.map(x=>x.event),[
+    {type:'monitor_text',text:'hello 猫',replace:true,slot:0,revision:1},
+    {type:'monitor_key',key:'enter',shift:true,slot:0,revision:1},
+    {type:'monitor_key',key:'commit',shift:false,slot:0,revision:1}
+  ]);
+});
+
+test('list wheel input uses scaled stage coordinates',()=>{
+  const {handlers,sent}=player();
+  handlers['stage:wheel']({clientX:820,clientY:590,deltaY:120,preventDefault(){}});
+  assert.deepEqual(sent.at(-1).event,{type:'wheel',x:120,y:-90,delta:3});
+});
 
 test('questions use plain text and submit Unicode answers with the active id', () => {
   const {elements,sent,context} = player();

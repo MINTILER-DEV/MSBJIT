@@ -212,6 +212,7 @@ async fn session(socket: WebSocket, state: ServerState) -> Result<()> {
     let mut monitor_pointer = crate::monitors::display::Pointer::default();
     let mut prompt_timer = tokio::time::interval(Duration::from_millis(50));
     let mut prompt_id = None;
+    let mut editor_id = None;
     let result = async {
         loop {
             let message = tokio::select! {
@@ -219,8 +220,21 @@ async fn session(socket: WebSocket, state: ServerState) -> Result<()> {
                     let question = state.scene.question.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     let id = question.as_ref().map(|q| q.id);
                     if id != prompt_id {
+                        if question.is_some() { monitor_pointer.finish_editing(&state.scene); }
                         output.send(Message::Text(serde_json::json!({"type":"question","question":question}).to_string().into())).await?;
                         prompt_id = id;
+                    }
+                    let editor = {
+                        let monitors=state.scene.monitors.lock().unwrap_or_else(|e|e.into_inner());
+                        monitors.iter().filter(|m|m.visible).find_map(|m| {
+                            let e=m.list.as_ref()?.editor.as_ref()?;
+                            Some(serde_json::json!({"slot":m.slot,"revision":e.revision,"index":e.index,"text":e.text.as_ref()?,"label":m.label}))
+                        })
+                    };
+                    let id=editor.as_ref().map(|e|(e["slot"].as_u64(),e["revision"].as_u64()));
+                    if id != editor_id {
+                        output.send(Message::Text(serde_json::json!({"type":"list_editor","editor":editor}).to_string().into())).await?;
+                        editor_id=id;
                     }
                     continue;
                 },
@@ -238,6 +252,14 @@ async fn session(socket: WebSocket, state: ServerState) -> Result<()> {
                             let event: InputEvent =
                                 serde_json::from_value(message["event"].clone())?;
                             match event {
+                                InputEvent::Key{..} if monitor_pointer.editing(&state.scene) => {}
+                                InputEvent::Wheel{x,y,delta} => { monitor_pointer.wheel(&state.scene,x,y,delta); }
+                                InputEvent::MonitorText{slot,revision,text,replace} => {
+                                    if monitor_pointer.editor_target(&state.scene)==Some((slot,revision)) { monitor_pointer.text(&state.scene,&text,replace); }
+                                }
+                                InputEvent::MonitorKey{slot,revision,key,shift} => {
+                                    if monitor_pointer.editor_target(&state.scene)==Some((slot,revision)) { monitor_pointer.key(&state.scene,&key,shift); }
+                                }
                                 InputEvent::Mouse { x, y, down } => {
                                     let consumed = monitor_pointer.update(&state.scene, x, y, down);
                                     if down

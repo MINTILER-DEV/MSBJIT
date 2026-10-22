@@ -775,7 +775,11 @@ impl Vm {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         for m in monitors.iter_mut().filter(|m| m.visible) {
-            m.update(self.program.values.decode(self.vars[m.slot]));
+            if m.list.is_some() {
+                m.update_list(&self.lists[m.slot], &self.program.values);
+            } else {
+                m.update(self.program.values.decode(self.vars[m.slot]));
+            }
         }
         self.monitor_published = Instant::now();
     }
@@ -811,6 +815,52 @@ impl Vm {
             let (input, events) = self.shared.input.drain();
             self.input = input;
             for event in events {
+                if let InputEvent::ListMutation {
+                    slot,
+                    index,
+                    op,
+                    text,
+                } = event
+                {
+                    let mut monitors = self
+                        .shared
+                        .monitors
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if let Some(m) = monitors
+                        .iter_mut()
+                        .find(|m| m.slot == slot && m.visible && m.list.is_some())
+                    {
+                        let list = &mut self.lists[slot];
+                        match op {
+                            0 if index < list.len() => {
+                                let value = self.program.values.encode(ScratchValue::String(text));
+                                list.replace(index, value);
+                            }
+                            1 if index <= list.len() && list.len() < 200_000 => {
+                                let value = self
+                                    .program
+                                    .values
+                                    .encode(ScratchValue::String(String::new()));
+                                list.insert(index, value);
+                                m.list.as_mut().unwrap().activate(index);
+                            }
+                            2 if index < list.len() => {
+                                list.remove(index);
+                                let ui = m.list.as_mut().unwrap();
+                                if list.is_empty() {
+                                    ui.editor = None;
+                                } else {
+                                    ui.activate(index.min(list.len() - 1));
+                                }
+                            }
+                            _ => {}
+                        }
+                        self.list_views[slot] = list.view();
+                        m.update_list(list, &self.program.values);
+                    }
+                    continue;
+                }
                 if let InputEvent::Answer { id, text } = event {
                     if self.questions.front().is_some_and(|q| q.id == id) {
                         self.answer = text;
@@ -825,7 +875,9 @@ impl Vm {
                         .monitors
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
-                    if let Some(m) = monitors.iter_mut().find(|m| m.slot == slot)
+                    if let Some(m) = monitors
+                        .iter_mut()
+                        .find(|m| m.slot == slot && m.list.is_none())
                         && let Some(value) = m.slider_value(value)
                     {
                         self.vars[slot] = number(value);
@@ -1877,13 +1929,23 @@ pub(crate) extern "C" fn rt_action(vm: &mut Vm, op: u32, a: u64, b: u64) {
         vm.layer(vm.current.target, value.text() == "front");
         return;
     }
-    if op == 28 || op == 29 {
+    if matches!(op, 28 | 29 | 45 | 46) {
         let slot = value.to_number() as usize;
         let mut monitors = vm.shared.monitors.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(m) = monitors.iter_mut().find(|m| m.slot == slot) {
-            m.visible = op == 28;
+        let is_list = op >= 45;
+        if let Some(m) = monitors
+            .iter_mut()
+            .find(|m| m.slot == slot && m.list.is_some() == is_list)
+        {
+            m.visible = op == 28 || op == 45;
             if m.visible {
-                m.update(vm.program.values.decode(vm.vars[slot]));
+                if is_list {
+                    m.update_list(&vm.lists[slot], &vm.program.values);
+                } else {
+                    m.update(vm.program.values.decode(vm.vars[slot]));
+                }
+            } else if let Some(list) = &mut m.list {
+                list.editor = None;
             }
         }
         return;

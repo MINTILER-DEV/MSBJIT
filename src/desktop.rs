@@ -71,6 +71,7 @@ pub fn show(
         }
         window.update_with_buffer(&buffer, WIDTH, HEIGHT)?;
         if !window.is_active() {
+            monitor_pointer.finish_editing(&scene);
             scene.input.send(InputEvent::Release);
             held.clear();
             mouse_down = false;
@@ -83,8 +84,10 @@ pub fn show(
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let answering = question.is_some();
+        let editing = monitor_pointer.editing(&scene);
         let characters = std::mem::take(&mut *text_input.lock().unwrap_or_else(|e| e.into_inner()));
         if let Some(question) = &question {
+            monitor_pointer.finish_editing(&scene);
             if question_id != Some(question.id) {
                 question_id = Some(question.id);
                 draft.clear();
@@ -115,8 +118,38 @@ pub fn show(
             }
         } else {
             question_id = None;
+            if monitor_pointer.editing(&scene) {
+                let text: String = characters.into_iter().collect();
+                if !text.is_empty() {
+                    monitor_pointer.text(&scene, &text, false);
+                }
+                let shift =
+                    window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
+                for (key, name) in [
+                    (Key::Backspace, "backspace"),
+                    (Key::Delete, "delete"),
+                    (Key::Left, "left"),
+                    (Key::Right, "right"),
+                    (Key::Home, "home"),
+                    (Key::End, "end"),
+                    (Key::Up, "up"),
+                    (Key::Down, "down"),
+                    (Key::Tab, "tab"),
+                    (Key::Enter, "enter"),
+                    (Key::Escape, "escape"),
+                ] {
+                    if window.is_key_pressed(key, KeyRepeat::Yes) {
+                        monitor_pointer.key(&scene, name, shift);
+                    }
+                }
+                if (window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl))
+                    && window.is_key_pressed(Key::A, KeyRepeat::No)
+                {
+                    monitor_pointer.key(&scene, "select all", false);
+                }
+            }
         }
-        let keys: HashSet<String> = if answering {
+        let keys: HashSet<String> = if answering || editing || monitor_pointer.editing(&scene) {
             HashSet::new()
         } else {
             window.get_keys().into_iter().filter_map(key_name).collect()
@@ -157,6 +190,9 @@ pub fn show(
                 let (x, y) = (x - 240.0, 180.0 - (y - TOOLBAR as f64));
                 last_mouse = (x, y);
                 let consumed = monitor_pointer.update(&scene, x, y, down);
+                if !answering && let Some((_, wheel)) = window.get_scroll_wheel() {
+                    monitor_pointer.wheel(&scene, x, y, -wheel as f64);
+                }
                 if pressed
                     && answering
                     && (200.0..224.0).contains(&x)

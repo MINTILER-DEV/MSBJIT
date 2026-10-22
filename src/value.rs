@@ -200,6 +200,9 @@ impl Values {
             _ => Cow::Owned(f64::from_bits(value).to_string()),
         }
     }
+    pub(crate) fn monitor_text(&self, value: u64, max_chars: usize) -> String {
+        self.text(value).chars().take(max_chars).collect()
+    }
     pub fn compare(&self, a: u64, b: u64) -> std::cmp::Ordering {
         if let (Some(a), Some(b)) = (self.comparison_number(a), self.comparison_number(b)) {
             return a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal);

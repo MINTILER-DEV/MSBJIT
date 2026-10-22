@@ -11,6 +11,7 @@ p{color:#9ca3af}button{background:#6366f1;color:white;border:0;border-radius:8px
 <p id="status" role="status">Ready to connect to the native runtime</p>
 <div><button id="connect">Connect</button> <button id="flag" disabled>▶ Green flag</button> <button id="stop" disabled>■ Stop</button></div>
 <form id="question" hidden><label id="question-label" for="answer"></label><br><input id="answer" maxlength="16384" autocomplete="off" aria-label="Answer"><button type="submit">Submit</button></form>
+<form id="list-editor" hidden><label id="list-label" for="list-value"></label><br><input id="list-value" maxlength="16384" autocomplete="off" aria-label="List item"><button type="submit">Insert next row</button><button id="list-done" type="button">Done</button></form>
 <p>Click the stage to focus. Use letters, numbers, arrows, space, Enter, and the mouse.</p>
 <script>
 const status = document.querySelector('#status'), button = document.querySelector('#connect');
@@ -18,6 +19,23 @@ const stage = document.querySelector('#stage'), flag = document.querySelector('#
 let peer, socket, mouseDown = false;
 const questionForm = document.querySelector('#question'), questionLabel = document.querySelector('#question-label'), answerInput = document.querySelector('#answer');
 let questionId = null;
+const listForm=document.querySelector('#list-editor'), listLabel=document.querySelector('#list-label'), listInput=document.querySelector('#list-value');
+let listEditor=null;
+function sendList(event) {if(listEditor) send({...event,slot:listEditor.slot,revision:listEditor.revision});}
+function showListEditor(editor) {
+  listEditor=editor;
+  listForm.hidden=!editor;
+  listLabel.textContent=editor ? `${editor.label}: item ${editor.index+1}` : '';
+  listInput.value=editor?.text ?? '';
+  if(editor) {listInput.focus(); listInput.select();}
+}
+listInput.oninput=()=>sendList({type:'monitor_text',text:listInput.value,replace:true});
+listInput.addEventListener('keydown',e=>{
+  const key={Tab:'tab',ArrowUp:'up',ArrowDown:'down',Enter:'enter',Escape:'escape'}[e.key];
+  if(key) {e.preventDefault();sendList({type:'monitor_key',key,shift:!!e.shiftKey}); if(key==='escape') {showListEditor(null);stage.focus();}}
+});
+listForm.onsubmit=e=>{e.preventDefault();sendList({type:'monitor_key',key:'enter',shift:false});};
+document.querySelector('#list-done').onclick=()=>{sendList({type:'monitor_key',key:'commit',shift:false});showListEditor(null);stage.focus();};
 function showQuestion(question) {
   questionId = question?.id ?? null;
   questionForm.hidden = !question;
@@ -59,6 +77,11 @@ stage.addEventListener('pointerdown', e => {
   stage.focus(); stage.setPointerCapture(e.pointerId); mouseDown = true; pointer(e,true); e.preventDefault();
 });
 stage.addEventListener('pointermove', e => {if(e.isPrimary) pointer(e,mouseDown);});
+stage.addEventListener('wheel',e=>{
+  const r=stage.getBoundingClientRect();
+  send({type:'wheel',x:(e.clientX-r.left)/r.width*480-240,y:180-(e.clientY-r.top)/r.height*360,delta:e.deltaY/40});
+  e.preventDefault();
+},{passive:false});
 stage.addEventListener('pointerup', e => {if(e.isPrimary) {mouseDown = false; pointer(e,false);}});
 stage.addEventListener('pointercancel', release);
 stage.addEventListener('lostpointercapture', () => {mouseDown = false; send({type:'mouse',x:0,y:0,down:false});});
@@ -82,6 +105,7 @@ button.onclick = async () => {
       try {
         const answer = JSON.parse(e.data);
         if (answer.type === 'question') {showQuestion(answer.question); return;}
+        if (answer.type === 'list_editor') {showListEditor(answer.editor); return;}
         if (answer.type === 'answer') {
           await peer.setRemoteDescription(answer);
           flag.disabled = stop.disabled = false;
@@ -90,7 +114,7 @@ button.onclick = async () => {
         }
       } catch (error) {status.textContent = error.message;}
     };
-    socket.onclose = () => {showQuestion(null); mouseDown = false; status.textContent = 'Disconnected'; peer.close(); button.disabled = false; flag.disabled = stop.disabled = true;};
+    socket.onclose = () => {showQuestion(null); showListEditor(null); mouseDown = false; status.textContent = 'Disconnected'; peer.close(); button.disabled = false; flag.disabled = stop.disabled = true;};
     await peer.setLocalDescription(await peer.createOffer());
     if (peer.iceGatheringState !== 'complete') await new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('Local ICE gathering timed out')), 10000);
