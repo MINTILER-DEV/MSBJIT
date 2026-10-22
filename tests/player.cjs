@@ -7,7 +7,7 @@ const vm = require('node:vm');
 function player() {
   const handlers = {}, sent = [];
   const elements = {};
-  for (const name of ['stage', 'connect', 'flag', 'stop', 'status']) {
+  for (const name of ['stage', 'connect', 'flag', 'stop', 'status', 'question', 'question-label', 'answer']) {
     elements[name] = {
       focus() {}, setPointerCapture() {},
       getBoundingClientRect: () => ({left: 100, top: 50, width: 960, height: 720}),
@@ -26,8 +26,19 @@ function player() {
   vm.runInContext(html.split('<script>')[1].split('</script>')[0], context);
   context.record = data => sent.push(JSON.parse(data));
   vm.runInContext('socket = {readyState: 1, send: record};', context);
-  return {handlers, elements, sent};
+  return {handlers, elements, sent, context};
 }
+
+test('questions use plain text and submit Unicode answers with the active id', () => {
+  const {elements,sent,context} = player();
+  vm.runInContext('showQuestion({id:7,text:"<b>Name?</b>"})',context);
+  assert.equal(elements['question-label'].textContent,'<b>Name?</b>');
+  assert.equal(elements.question.hidden,false);
+  elements.answer.value='Player 星';
+  elements.question.onsubmit({preventDefault(){}});
+  assert.deepEqual(sent.at(-1).event,{type:'answer',id:7,text:'Player 星'});
+  assert.equal(elements.question.hidden,true);
+});
 
 test('focused stage sends normalized keys and prevents page scrolling', () => {
   const {handlers, sent} = player();

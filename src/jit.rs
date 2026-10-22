@@ -81,6 +81,12 @@ impl NativeProgram {
                 Some(types::I32),
             ),
             (
+                "ask",
+                rt_ask as *const u8,
+                vec![types::I64, types::I32],
+                None,
+            ),
+            (
                 "wait",
                 rt_wait as *const u8,
                 vec![types::F64, types::I32],
@@ -381,6 +387,12 @@ impl NativeProgram {
                         let pc = e.i32(node.next);
                         let waiting = e.call("play_until_done", &[sound, pc]).unwrap();
                         e.b.ins().brif(waiting, exit, &[], next, &[]);
+                    }
+                    Op::Ask(question) => {
+                        let question = e.expr(question);
+                        let pc = e.i32(node.next);
+                        e.call("ask", &[question, pc]);
+                        e.b.ins().jump(exit, &[]);
                     }
                     Op::GlideTo(seconds, target) => {
                         let seconds = e.expr(seconds);

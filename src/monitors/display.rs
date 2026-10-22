@@ -122,6 +122,49 @@ pub(crate) struct Overlay {
     previous: Vec<Monitor>,
     pixels: Vec<u8>,
 }
+
+pub(crate) fn question_overlay(scene: &SharedScene, rgba: &mut [u8]) {
+    let question = scene
+        .question
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let Some(question) = question else {
+        return;
+    };
+    let mut p = Pixmap::new(480, 360).unwrap();
+    rounded(&mut p, 8.0, 292.0, 464.0, 60.0, 8.0, [133, 92, 214]);
+    rounded(&mut p, 10.0, 294.0, 460.0, 56.0, 6.0, [255; 3]);
+    let label: String = question.text.chars().take(64).collect();
+    text(&mut p, &label, 240.0, 296.0, 12.0, true, [70; 3]);
+    rounded(&mut p, 18.0, 318.0, 418.0, 25.0, 12.0, [220, 211, 245]);
+    rounded(&mut p, 20.0, 320.0, 414.0, 21.0, 10.0, [255; 3]);
+    let mut chars: Vec<_> = question.draft.chars().rev().take(45).collect();
+    chars.reverse();
+    let draft: String = chars.into_iter().collect();
+    text(
+        &mut p,
+        &format!("{}|", draft),
+        227.0,
+        320.0,
+        13.0,
+        false,
+        [60; 3],
+    );
+    rounded(&mut p, 440.0, 319.0, 24.0, 24.0, 12.0, [133, 92, 214]);
+    text(&mut p, ">", 452.0, 320.0, 16.0, true, [255; 3]);
+    for (dst, src) in rgba
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(p.data().as_chunks::<4>().0)
+    {
+        let inv = 255 - src[3] as u32;
+        for c in 0..3 {
+            dst[c] = (src[c] as u32 + (dst[c] as u32 * inv + 127) / 255).min(255) as u8;
+        }
+    }
+}
 impl Overlay {
     pub fn composite(&mut self, scene: &SharedScene, rgba: &mut [u8]) {
         let monitors: Vec<_> = scene
@@ -353,6 +396,36 @@ mod tests {
             {"id":"c","opcode":"data_variable","mode":"slider","x":10,"y":100,"visible":true,"sliderMin":10,"sliderMax":20},
             {"id":"d","opcode":"data_variable","mode":"slider","x":210,"y":100,"visible":true,"sliderMin":-1,"sliderMax":1,"isDiscrete":false}
         ]})).unwrap())
+    }
+    #[test]
+    fn question_overlay_renders_text_and_clears_after_submission() {
+        let running = runtime::spawn(project(), RuntimeOptions::default()).unwrap();
+        let scene = running.scene.clone();
+        running.join().unwrap();
+        *scene.question.lock().unwrap() = Some(crate::runtime::QuestionPrompt {
+            id: 1,
+            text: "What is your name?".into(),
+            draft: "Player1".into(),
+        });
+        let mut rgba = vec![255; 480 * 360 * 4];
+        question_overlay(&scene, &mut rgba);
+        assert_eq!(&rgba[(300 * 480 + 9) * 4..][..3], &[133, 92, 214]);
+        assert!(
+            rgba[(296 * 480) * 4..(344 * 480) * 4]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[..3].iter().all(|c| *c < 120))
+                .count()
+                > 100
+        );
+        if let Ok(path) = std::env::var("MSBJIT_QUESTION_CAPTURE") {
+            image::save_buffer(path, &rgba, 480, 360, image::ColorType::Rgba8).unwrap();
+        }
+        *scene.question.lock().unwrap() = None;
+        let mut clear = vec![255; 480 * 360 * 4];
+        question_overlay(&scene, &mut clear);
+        assert!(clear.iter().all(|v| *v == 255));
     }
     #[test]
     fn overlay_matches_scratch_geometry_and_clears_hidden_monitors() {

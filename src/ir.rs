@@ -34,6 +34,7 @@ pub(crate) enum Op {
     Glide(Expr, Expr, Expr),
     GlideTo(Expr, Expr),
     PlayUntilDone(Expr),
+    Ask(Expr),
     DeleteClone,
     Yield(usize),
     Broadcast(Expr, bool),
@@ -411,6 +412,7 @@ impl Lower<'_> {
                 ));
             }
             let unary = match opcode.as_str() {
+                "sensing_distanceto" => Some((19, "DISTANCETOMENU")),
                 "sensing_touchingobject" => Some((18, "TOUCHINGOBJECTMENU")),
                 "operator_not" => Some((0, "OPERAND")),
                 "operator_length" => Some((1, "STRING")),
@@ -455,6 +457,12 @@ impl Lower<'_> {
                 "sensing_username" => 11,
                 "translate_getViewerLanguage" => 12,
                 "sound_volume" => 13,
+                "sensing_answer" => 14,
+                "sensing_distancetomenu" => {
+                    return Ok(
+                        self.constant(ScratchValue::String(b.field("DISTANCETOMENU")?.into()))
+                    );
+                }
                 "sensing_touchingobjectmenu" => {
                     return Ok(
                         self.constant(ScratchValue::String(b.field("TOUCHINGOBJECTMENU")?.into()))
@@ -782,6 +790,7 @@ impl Lower<'_> {
             "pen_stamp" => Op::Action(26, self.zero(), self.zero()),
             "sound_play" => Op::Action(27, self.expr_input(b, "SOUND_MENU")?, self.zero()),
             "sound_playuntildone" => Op::PlayUntilDone(self.expr_input(b, "SOUND_MENU")?),
+            "sensing_askandwait" => Op::Ask(self.expr_input(b, "QUESTION")?),
             "sound_stopallsounds" => Op::Action(36, self.zero(), self.zero()),
             "sound_setvolumeto" => Op::Action(37, self.expr_input(b, "VOLUME")?, self.zero()),
             "sound_changevolumeby" => Op::Action(38, self.expr_input(b, "VOLUME")?, self.zero()),

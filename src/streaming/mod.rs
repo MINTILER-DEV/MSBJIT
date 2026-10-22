@@ -209,9 +209,20 @@ async fn session(socket: WebSocket, state: ServerState) -> Result<()> {
     let mut shutdown = state.shutdown;
     let mut mouse_down = false;
     let mut monitor_pointer = crate::monitors::display::Pointer::default();
+    let mut prompt_timer = tokio::time::interval(Duration::from_millis(50));
+    let mut prompt_id = None;
     let result = async {
         loop {
             let message = tokio::select! {
+                _=prompt_timer.tick()=>{
+                    let question = state.scene.question.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let id = question.as_ref().map(|q| q.id);
+                    if id != prompt_id {
+                        output.send(Message::Text(serde_json::json!({"type":"question","question":question}).to_string().into())).await?;
+                        prompt_id = id;
+                    }
+                    continue;
+                },
                 _=shutdown.changed()=>break,
                 message=input.next()=>message,
             };

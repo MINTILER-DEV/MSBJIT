@@ -10,11 +10,26 @@ p{color:#9ca3af}button{background:#6366f1;color:white;border:0;border-radius:8px
 <h1>MSBJIT</h1><video id="stage" tabindex="0" aria-label="Scratch stage. Click to focus, then use the keyboard." autoplay muted playsinline></video>
 <p id="status" role="status">Ready to connect to the native runtime</p>
 <div><button id="connect">Connect</button> <button id="flag" disabled>▶ Green flag</button> <button id="stop" disabled>■ Stop</button></div>
+<form id="question" hidden><label id="question-label" for="answer"></label><br><input id="answer" maxlength="16384" autocomplete="off" aria-label="Answer"><button type="submit">Submit</button></form>
 <p>Click the stage to focus. Use letters, numbers, arrows, space, Enter, and the mouse.</p>
 <script>
 const status = document.querySelector('#status'), button = document.querySelector('#connect');
 const stage = document.querySelector('#stage'), flag = document.querySelector('#flag'), stop = document.querySelector('#stop');
 let peer, socket, mouseDown = false;
+const questionForm = document.querySelector('#question'), questionLabel = document.querySelector('#question-label'), answerInput = document.querySelector('#answer');
+let questionId = null;
+function showQuestion(question) {
+  questionId = question?.id ?? null;
+  questionForm.hidden = !question;
+  questionLabel.textContent = question?.text ?? '';
+  answerInput.value = '';
+  if (question) {release(); answerInput.focus();}
+}
+questionForm.onsubmit = e => {
+  e.preventDefault();
+  if (questionId !== null) send({type:'answer',id:questionId,text:answerInput.value});
+  showQuestion(null); stage.focus();
+};
 function send(event) {
   if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({type:'input', event}));
 }
@@ -66,6 +81,7 @@ button.onclick = async () => {
     socket.onmessage = async e => {
       try {
         const answer = JSON.parse(e.data);
+        if (answer.type === 'question') {showQuestion(answer.question); return;}
         if (answer.type === 'answer') {
           await peer.setRemoteDescription(answer);
           flag.disabled = stop.disabled = false;
@@ -74,7 +90,7 @@ button.onclick = async () => {
         }
       } catch (error) {status.textContent = error.message;}
     };
-    socket.onclose = () => {mouseDown = false; status.textContent = 'Disconnected'; peer.close(); button.disabled = false; flag.disabled = stop.disabled = true;};
+    socket.onclose = () => {showQuestion(null); mouseDown = false; status.textContent = 'Disconnected'; peer.close(); button.disabled = false; flag.disabled = stop.disabled = true;};
     await peer.setLocalDescription(await peer.createOffer());
     if (peer.iceGatheringState !== 'complete') await new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('Local ICE gathering timed out')), 10000);

@@ -8,6 +8,10 @@ use std::{
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InputEvent {
+    Answer {
+        id: u64,
+        text: String,
+    },
     Key {
         key: String,
         down: bool,
@@ -75,6 +79,16 @@ impl InputController {
     pub fn send(&self, event: InputEvent) {
         let mut pending = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let event = match event {
+            InputEvent::Answer { id, mut text } => {
+                if text.len() > 16384 {
+                    let mut end = 16384;
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    text.truncate(end);
+                }
+                InputEvent::Answer { id, text }
+            }
             InputEvent::Key { key, down } => {
                 let Some(key) = normalize_key(&key) else {
                     return;

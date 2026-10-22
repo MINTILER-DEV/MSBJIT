@@ -428,6 +428,7 @@ impl Renderer {
         }
         let mut rgba = self.capture(states)?;
         self.monitors.composite(scene, &mut rgba);
+        crate::monitors::display::question_overlay(scene, &mut rgba);
         Ok(rgba)
     }
     fn capture(&mut self, states: &[SpriteState]) -> Result<Vec<u8>> {
@@ -1204,6 +1205,7 @@ mod tests {
             .iter()
             .position(|t| t.name == "Player")
             .context("missing player")?;
+        let restored = std::env::var_os("MSBJIT_DOIRS_RESTORED").is_some();
         let menu = p
             .targets
             .iter()
@@ -1251,7 +1253,7 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         scene.input.send(InputEvent::Release);
-        thread::sleep(Duration::from_millis(1500));
+        thread::sleep(Duration::from_millis(if restored { 3000 } else { 1500 }));
         let before = scene.snapshot(&p)[player].clone();
         for key in ["right arrow", "up arrow", "left arrow", "down arrow"] {
             scene.input.send(InputEvent::Key {
@@ -1288,6 +1290,13 @@ mod tests {
         // after Space starts the game. Synthetic tests cover movement
         // and alpha collision semantics independently of that export damage.
         assert!(report.steps > 1000);
+        if restored {
+            assert_ne!(
+                (before.x, before.y),
+                (after.x, after.y),
+                "restored input reporters must allow player movement"
+            );
+        }
         eprintln!(
             "Doirs: {} steps, player ({},{}) -> ({},{})",
             report.steps, before.x, before.y, after.x, after.y

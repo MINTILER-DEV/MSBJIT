@@ -79,7 +79,14 @@ struct AtomicSprite {
     costume: AtomicUsize,
     rotation: AtomicUsize,
 }
+#[derive(Debug, Clone, Serialize)]
+pub struct QuestionPrompt {
+    pub id: u64,
+    pub text: String,
+    pub draft: String,
+}
 pub struct SharedScene {
+    pub question: Mutex<Option<QuestionPrompt>>,
     pub(crate) pen: Mutex<PenCanvas>,
     pub(crate) monitors: Mutex<Vec<crate::monitors::Monitor>>,
     pub input: InputController,
@@ -92,6 +99,7 @@ pub struct SharedScene {
 impl SharedScene {
     fn new(project: &Project) -> Self {
         Self {
+            question: Mutex::new(None),
             pen: Mutex::new(PenCanvas::default()),
             monitors: Mutex::new(crate::monitors::create(project)),
             input: InputController::default(),
@@ -282,6 +290,7 @@ struct Fiber {
     done: bool,
     glide: Option<Glide>,
     sound_wait: Option<u64>,
+    ask_wait: Option<u64>,
 }
 struct Glide {
     start: Instant,
@@ -307,6 +316,7 @@ impl Fiber {
             done: false,
             glide: None,
             sound_wait: None,
+            ask_wait: None,
         }
     }
     fn warp(&self) -> bool {
@@ -363,6 +373,9 @@ pub(crate) struct Vm {
     pens: Vec<PenState>,
     audio: AudioPlayer,
     sound_states: Vec<SoundState>,
+    questions: VecDeque<QuestionPrompt>,
+    next_question: u64,
+    answer: String,
     #[cfg(feature = "graphics")]
     costume_pixels: HashMap<(usize, usize), Arc<CostumePixels>>,
     #[cfg(feature = "graphics")]
@@ -422,6 +435,9 @@ impl Vm {
             next_sprite_id: project.targets.len(),
             pens: vec![PenState::default(); project.targets.len()],
             audio: AudioPlayer::default(),
+            questions: VecDeque::new(),
+            next_question: 0,
+            answer: String::new(),
             sound_states: project
                 .targets
                 .iter()
@@ -457,6 +473,16 @@ impl Vm {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_nanos() as u64,
+        }
+    }
+    fn publish_question(&self) {
+        let mut prompt = self
+            .shared
+            .question
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if prompt.as_ref().map(|q| q.id) != self.questions.front().map(|q| q.id) {
+            *prompt = self.questions.front().cloned();
         }
     }
     fn clear_effects(&mut self) {
@@ -774,6 +800,14 @@ impl Vm {
             let (input, events) = self.shared.input.drain();
             self.input = input;
             for event in events {
+                if let InputEvent::Answer { id, text } = event {
+                    if self.questions.front().is_some_and(|q| q.id == id) {
+                        self.answer = text;
+                        self.questions.pop_front();
+                        self.publish_question();
+                    }
+                    continue;
+                }
                 if let InputEvent::MonitorSlider { slot, value } = event {
                     let mut monitors = self
                         .shared
@@ -790,11 +824,14 @@ impl Vm {
                 }
                 if matches!(event, InputEvent::Stop | InputEvent::Flag) {
                     fibers.clear();
+                    self.questions.clear();
+                    self.publish_question();
                     self.audio.stop();
                     self.clear_clones();
                     self.clear_effects();
                 }
                 if matches!(event, InputEvent::Flag) {
+                    self.answer.clear();
                     self.timer = Instant::now();
                 }
                 for (script_id, script) in self.program.scripts.iter().enumerate() {
@@ -866,6 +903,13 @@ impl Vm {
                         continue;
                     }
                     fibers[index].sound_wait = None;
+                }
+                if let Some(id) = fibers[index].ask_wait {
+                    if self.questions.iter().any(|q| q.id == id) {
+                        index += 1;
+                        continue;
+                    }
+                    fibers[index].ask_wait = None;
                 }
                 std::mem::swap(&mut self.current, &mut fibers[index]);
                 if let Some(glide) = &self.current.glide {
@@ -1000,6 +1044,9 @@ impl Vm {
                 dispatched += 1;
             }
             fibers.retain(|f| !f.done);
+            self.questions
+                .retain(|q| fibers.iter().any(|f| f.ask_wait == Some(q.id)));
+            self.publish_question();
             refresh_waiters(&mut fibers);
             let roots =
                 self.program
@@ -1030,6 +1077,7 @@ impl Vm {
             } else if fibers.iter().all(|f| {
                 !f.waiting.is_empty()
                     || f.sound_wait.is_some()
+                    || f.ask_wait.is_some()
                     || f.wake.is_some_and(|w| w > Instant::now())
             }) {
                 let mut next = fibers
@@ -1037,7 +1085,10 @@ impl Vm {
                     .filter_map(|f| f.wake)
                     .min()
                     .unwrap_or(Instant::now() + Duration::from_millis(1));
-                if fibers.iter().any(|f| f.sound_wait.is_some()) {
+                if fibers
+                    .iter()
+                    .any(|f| f.sound_wait.is_some() || f.ask_wait.is_some())
+                {
                     next = next.min(Instant::now() + Duration::from_millis(1));
                 }
                 self.sleep_until(next);
@@ -1466,6 +1517,19 @@ pub(crate) extern "C" fn rt_glide(vm: &mut Vm, seconds: f64, x: f64, y: f64, nex
     vm.current.pc = next as usize;
     1
 }
+pub(crate) extern "C" fn rt_ask(vm: &mut Vm, question: u64, next: u32) {
+    vm.next_question += 1;
+    let prompt = QuestionPrompt {
+        id: vm.next_question,
+        text: vm.value(question).text(),
+        draft: String::new(),
+    };
+    vm.current.ask_wait = Some(prompt.id);
+    vm.questions.push_back(prompt);
+    vm.current.pc = next as usize;
+    vm.jit.pc = next;
+    vm.publish_question();
+}
 pub(crate) extern "C" fn rt_play_until_done(vm: &mut Vm, sound: u64, next: u32) -> u32 {
     match vm.play_sound(&vm.value(sound)) {
         Ok(Some(sound)) => {
@@ -1613,6 +1677,27 @@ pub(crate) extern "C" fn rt_unary(vm: &mut Vm, op: u32, a: u64) -> u64 {
         });
     }
     let a = vm.value(a);
+    if op == 19 {
+        let target = vm.current.target;
+        let s = &vm.sprites[target];
+        let name = a.text();
+        let destination = if name == "_mouse_" {
+            Some((vm.input.x, vm.input.y))
+        } else {
+            vm.project
+                .targets
+                .iter()
+                .position(|t| !t.is_stage && t.name == name)
+                .map(|i| (vm.sprites[i].x, vm.sprites[i].y))
+        };
+        return number(if s.is_stage {
+            10000.0
+        } else {
+            destination
+                .map(|(x, y)| (s.x - x).hypot(s.y - y))
+                .unwrap_or(10000.0)
+        });
+    }
     if op == 18 {
         let result = vm.touching_object(&a.text());
         let touching = match result {
@@ -1633,6 +1718,12 @@ pub(crate) extern "C" fn rt_unary(vm: &mut Vm, op: u32, a: u64) -> u64 {
     vm.program.values.encode(result)
 }
 pub(crate) extern "C" fn rt_state(vm: &mut Vm, field: u32) -> u64 {
+    if field == 14 {
+        return vm
+            .program
+            .values
+            .encode(ScratchValue::String(vm.answer.clone()));
+    }
     if field == 13 {
         return number(vm.sound_states[vm.current.target].volume);
     }

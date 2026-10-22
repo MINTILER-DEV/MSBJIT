@@ -1,16 +1,28 @@
 //! Native stage window; no media encoder or browser is required.
 use crate::{input::InputEvent, project::Project, render::Renderer, runtime::SharedScene};
 use anyhow::{Context, Result};
-use minifb::{Key, MouseButton, MouseMode, Scale, ScaleMode, Window, WindowOptions};
+use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Scale, ScaleMode, Window, WindowOptions};
 use std::{
     collections::HashSet,
-    sync::{Arc, atomic::Ordering},
+    sync::{Arc, Mutex, atomic::Ordering},
     time::{Duration, Instant},
 };
 
 const WIDTH: usize = 480;
 const HEIGHT: usize = 392;
 const TOOLBAR: usize = 32;
+
+struct TextInput(Arc<Mutex<Vec<char>>>);
+impl minifb::InputCallback for TextInput {
+    fn add_char(&mut self, code: u32) {
+        if let Some(c) = char::from_u32(code).filter(|c| !c.is_control()) {
+            let mut input = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            if input.len() < 4096 {
+                input.push(c);
+            }
+        }
+    }
+}
 
 pub fn show(
     project: &Project,
@@ -31,6 +43,10 @@ pub fn show(
     )
     .context("open stage window")?;
     window.set_target_fps(fps as usize);
+    let text_input = Arc::new(Mutex::new(Vec::new()));
+    window.set_input_callback(Box::new(TextInput(text_input.clone())));
+    let mut question_id = None;
+    let mut draft = String::new();
     let mut renderer = pollster::block_on(Renderer::new(project))?;
     scene.input.send(InputEvent::Flag);
     let mut buffer = vec![0x1f2937; WIDTH * HEIGHT];
@@ -60,7 +76,50 @@ pub fn show(
             monitor_pointer.release();
             continue;
         }
-        let keys: HashSet<String> = window.get_keys().into_iter().filter_map(key_name).collect();
+        let question = scene
+            .question
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let answering = question.is_some();
+        let characters = std::mem::take(&mut *text_input.lock().unwrap_or_else(|e| e.into_inner()));
+        if let Some(question) = &question {
+            if question_id != Some(question.id) {
+                question_id = Some(question.id);
+                draft.clear();
+            } else {
+                for c in characters {
+                    if draft.len() + c.len_utf8() <= 16384 {
+                        draft.push(c);
+                    }
+                }
+            }
+            if window.is_key_pressed(Key::Backspace, KeyRepeat::Yes) {
+                draft.pop();
+            }
+            if window.is_key_pressed(Key::Enter, KeyRepeat::No) {
+                scene.input.send(InputEvent::Answer {
+                    id: question.id,
+                    text: draft.clone(),
+                });
+            }
+            if let Some(prompt) = scene
+                .question
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_mut()
+                && prompt.id == question.id
+            {
+                prompt.draft = draft.clone();
+            }
+        } else {
+            question_id = None;
+        }
+        let keys: HashSet<String> = if answering {
+            HashSet::new()
+        } else {
+            window.get_keys().into_iter().filter_map(key_name).collect()
+        };
         for key in keys.difference(&held) {
             scene.input.send(InputEvent::Key {
                 key: key.clone(),
@@ -97,13 +156,25 @@ pub fn show(
                 let (x, y) = (x - 240.0, 180.0 - (y - TOOLBAR as f64));
                 last_mouse = (x, y);
                 let consumed = monitor_pointer.update(&scene, x, y, down);
+                if pressed
+                    && answering
+                    && (200.0..224.0).contains(&x)
+                    && (-164.0..-139.0).contains(&y)
+                    && let Some(question) = &question
+                {
+                    scene.input.send(InputEvent::Answer {
+                        id: question.id,
+                        text: draft.clone(),
+                    });
+                }
                 scene.input.send(InputEvent::Mouse {
                     x,
                     y,
-                    down: down && !consumed,
+                    down: down && !consumed && !answering,
                 });
                 if pressed
                     && !consumed
+                    && !answering
                     && let Some(target) = renderer.hit_test(&states, x, y)
                 {
                     scene.input.send(InputEvent::Click { target });

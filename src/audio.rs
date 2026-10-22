@@ -44,6 +44,9 @@ struct Decoded {
     duration: f64,
 }
 fn decode(data: &[u8]) -> Result<Decoded> {
+    if !data.starts_with(b"RIFF") {
+        return decode_mp3(data);
+    }
     let mut wav = hound::WavReader::new(Cursor::new(data)).context("decode WAV sound")?;
     let spec = wav.spec();
     ensure!(
@@ -77,6 +80,61 @@ fn decode(data: &[u8]) -> Result<Decoded> {
         channels: spec.channels,
         #[cfg(windows)]
         rate: spec.sample_rate,
+    })
+}
+fn decode_mp3(data: &[u8]) -> Result<Decoded> {
+    use symphonia::core::{audio::SampleBuffer, errors::Error, io::MediaSourceStream, probe::Hint};
+    let stream = MediaSourceStream::new(Box::new(Cursor::new(data.to_vec())), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension("mp3");
+    let mut format = symphonia::default::get_probe()
+        .format(&hint, stream, &Default::default(), &Default::default())
+        .context("decode MP3 sound")?
+        .format;
+    let track = format
+        .default_track()
+        .context("MP3 sound has no audio track")?;
+    let id = track.id;
+    let mut decoder =
+        symphonia::default::get_codecs().make(&track.codec_params, &Default::default())?;
+    let mut samples = Vec::new();
+    let mut spec = None;
+    loop {
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(Error::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e).context("read MP3 sound"),
+        };
+        if packet.track_id() != id {
+            continue;
+        }
+        let decoded = decoder.decode(&packet).context("decode MP3 frame")?;
+        let current = *decoded.spec();
+        ensure!(
+            (1..=2).contains(&current.channels.count()) && current.rate > 0,
+            "MP3 sound must be mono or stereo"
+        );
+        ensure!(
+            spec.is_none_or(|s| s == current),
+            "MP3 format changes within sound"
+        );
+        spec = Some(current);
+        let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, current);
+        buffer.copy_interleaved_ref(decoded);
+        ensure!(
+            samples.len() + buffer.samples().len() <= 32 * 1024 * 1024,
+            "decoded sound exceeds 128 MiB"
+        );
+        samples.extend_from_slice(buffer.samples());
+    }
+    let spec = spec.context("MP3 sound has no decoded samples")?;
+    Ok(Decoded {
+        duration: samples.len() as f64 / spec.channels.count() as f64 / spec.rate as f64,
+        samples,
+        #[cfg(windows)]
+        channels: spec.channels.count() as u16,
+        #[cfg(windows)]
+        rate: spec.rate,
     })
 }
 struct Voice {
@@ -275,6 +333,31 @@ impl rodio::Source for PannedSamples {
     }
 }
 
+#[cfg(test)]
+mod decode_tests {
+    #[test]
+    fn mp3_decodes_with_a_real_timeline() {
+        let decoded = super::decode(include_bytes!("../tests/fixtures/audio/silence.mp3")).unwrap();
+        assert!(decoded.duration >= 0.075 && decoded.duration < 0.25);
+        assert!(!decoded.samples.is_empty());
+    }
+    #[test]
+    #[ignore = "requires MSBJIT_AUDIO_PROJECT"]
+    fn all_external_project_sounds_decode() {
+        let path = std::env::var("MSBJIT_AUDIO_PROJECT").expect("MSBJIT_AUDIO_PROJECT");
+        let project = crate::project::Project::load(path).unwrap();
+        let mut count = 0;
+        for target in &project.targets {
+            for sound in &target.sounds {
+                super::decode(&project.assets[&sound.md5ext])
+                    .unwrap_or_else(|e| panic!("{} / {}: {e:#}", target.name, sound.name));
+                count += 1;
+            }
+        }
+        eprintln!("Decoded {count} sounds");
+        assert!(count > 0);
+    }
+}
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
