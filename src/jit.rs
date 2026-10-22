@@ -309,7 +309,7 @@ impl NativeProgram {
                         let stop = e.call("call", &[proc, pc]).unwrap();
                         e.b.ins().brif(stop, exit, &[], dispatch, &[]);
                     }
-                    Op::Return => {
+                    Op::Return | Op::Stop(1) => {
                         let stop = e.call("return", &[]).unwrap();
                         e.b.ins().brif(stop, exit, &[], dispatch, &[]);
                     }

@@ -957,7 +957,9 @@ pub(crate) extern "C" fn rt_stop(vm: &mut Vm, mode: u32) {
             }
             vm.current.done = true;
         }
-        1 => vm.current.done = true,
+        1 => {
+            rt_return(vm);
+        }
         _ => vm.events.push(Event::StopOthers),
     }
 }

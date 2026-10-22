@@ -494,7 +494,12 @@ pub(crate) fn decode(name: &str, data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
     if name.to_ascii_lowercase().ends_with(".svg") {
         let mut options = resvg::usvg::Options::default();
         options.image_href_resolver.resolve_string = Box::new(|_, _| None);
-        let tree = resvg::usvg::Tree::from_data(data, &options).context("parse SVG costume")?;
+        let tree = match resvg::usvg::Tree::from_data(data, &options) {
+            Ok(tree) => tree,
+            // Scratch projects commonly retain empty, zero-sized SVG costumes.
+            Err(resvg::usvg::Error::InvalidSize) => return Ok((1, 1, vec![0; 4])),
+            Err(error) => return Err(error).context("parse SVG costume"),
+        };
         let size = tree.size().to_int_size();
         ensure!(
             size.width() <= 4096 && size.height() <= 4096,
@@ -531,6 +536,91 @@ pub(crate) fn decode(name: &str, data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn zero_sized_svg_costumes_are_transparent_but_malformed_svgs_fail() -> Result<()> {
+        let (w, h, rgba) = decode(
+            "empty.svg",
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0" viewBox="0 0 0 0"/>"#,
+        )?;
+        assert_eq!((w, h), (1, 1));
+        assert_eq!(rgba, vec![0; 4]);
+        assert!(decode("invalid.svg", b"<svg").is_err());
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires --release, MSBJIT_LINUX_PROJECT, and a wgpu adapter"]
+    fn riscv_linux_project_starts_and_draws() -> Result<()> {
+        let Ok(path) = std::env::var("MSBJIT_LINUX_PROJECT") else {
+            return Ok(());
+        };
+        ensure!(
+            !cfg!(debug_assertions),
+            "run this emulator regression with cargo test --release"
+        );
+        let project = std::sync::Arc::new(Project::load(path)?);
+        let running = crate::runtime::spawn(
+            project.clone(),
+            crate::runtime::RuntimeOptions {
+                turbo: true,
+                time_limit: Some(std::time::Duration::from_secs(8)),
+                ..Default::default()
+            },
+        )?;
+        let scene = running.scene.clone();
+        let report = running.join()?;
+        eprintln!("Linux: {} steps, {} ticks", report.steps, report.ticks);
+        for variable in &report.variables {
+            if [
+                "state.pc",
+                "state.cyclel",
+                "__pc",
+                "Global.stageWidth",
+                "Global.stageHeight",
+                "@runFrame.state",
+            ]
+            .contains(&variable.name.as_str())
+            {
+                eprintln!("{} = {}", variable.name, variable.value.text());
+            }
+        }
+        let output = report
+            .lists
+            .iter()
+            .find(|l| l.name == "Terminal.outputBuffer")
+            .context("missing terminal output")?;
+        eprintln!(
+            "Terminal queue: {:?}",
+            &output.items[..output.items.len().min(100)]
+        );
+        let mut renderer = pollster::block_on(Renderer::new(&project))?;
+        let rgba = renderer.capture_scene(&scene, &report.sprites)?;
+        if let Ok(path) = std::env::var("MSBJIT_LINUX_CAPTURE") {
+            image::save_buffer(path, &rgba, WIDTH, HEIGHT, image::ColorType::Rgba8)?;
+        }
+        assert!(report.steps > 10_000);
+        let cycles = report
+            .variables
+            .iter()
+            .find(|v| v.name == "state.cyclel")
+            .context("missing CPU cycle counter")?;
+        assert!(
+            cycles.value.to_number() > 1.0,
+            "CPU did not progress: {}",
+            cycles.value.text()
+        );
+        assert!(
+            scene
+                .pen
+                .lock()
+                .unwrap()
+                .pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|p| p[3] > 0)
+        );
+        Ok(())
+    }
     #[test]
     #[ignore = "requires MSBJIT_HARDWARE_PROJECT and a wgpu adapter"]
     fn sbtext_hardware_emulator_boots_draws_and_accepts_keyboard() -> Result<()> {

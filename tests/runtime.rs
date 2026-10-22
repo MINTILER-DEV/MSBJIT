@@ -261,6 +261,32 @@ fn unused_custom_block_bodies_are_not_compiled() {
     );
     assert_eq!(value(&report, "n"), &ScratchValue::Number(42.0));
 }
+#[test]
+fn stop_this_script_returns_only_from_the_innermost_custom_block() {
+    for warp in [false, true] {
+        let report = run(
+            json!({
+                "hat":{"opcode":"event_whenflagclicked","topLevel":true,"next":"outer"},
+                "outer":{"opcode":"procedures_call","mutation":{"proccode":"outer"},"next":"after"},
+                "after":{"opcode":"data_changevariableby","fields":{"VARIABLE":["counter","n"]},"inputs":{"VALUE":[1,[4,"100"]]},"next":"root_stop"},
+                "root_stop":{"opcode":"control_stop","fields":{"STOP_OPTION":["this script",null]},"next":"bad"},
+                "bad":{"opcode":"data_setvariableto","fields":{"VARIABLE":["counter","n"]},"inputs":{"VALUE":[1,[4,"99999"]]}},
+                "outer_def":{"opcode":"procedures_definition","topLevel":true,"inputs":{"custom_block":[1,"outer_proto"]},"next":"loop"},
+                "outer_proto":{"opcode":"procedures_prototype","mutation":{"proccode":"outer","argumentids":"[]","argumentnames":"[]","argumentdefaults":"[]","warp":warp}},
+                "loop":{"opcode":"control_repeat","inputs":{"TIMES":[1,[6,"2"]],"SUBSTACK":[2,"inner"]}},
+                "inner":{"opcode":"procedures_call","mutation":{"proccode":"inner"},"next":"outer_after"},
+                "outer_after":{"opcode":"data_changevariableby","fields":{"VARIABLE":["counter","n"]},"inputs":{"VALUE":[1,[4,"10"]]}},
+                "inner_def":{"opcode":"procedures_definition","topLevel":true,"inputs":{"custom_block":[1,"inner_proto"]},"next":"inner_inc"},
+                "inner_proto":{"opcode":"procedures_prototype","mutation":{"proccode":"inner","argumentids":"[]","argumentnames":"[]","argumentdefaults":"[]","warp":"false"}},
+                "inner_inc":{"opcode":"data_changevariableby","fields":{"VARIABLE":["counter","n"]},"inputs":{"VALUE":[1,[4,"1"]]},"next":"stop"},
+                "stop":{"opcode":"control_stop","fields":{"STOP_OPTION":["this script",null]},"next":"bad_inner"},
+                "bad_inner":{"opcode":"data_setvariableto","fields":{"VARIABLE":["counter","n"]},"inputs":{"VALUE":[1,[4,"999"]]}}
+            }),
+            false,
+        );
+        assert_eq!(value(&report, "n"), &ScratchValue::Number(122.0));
+    }
+}
 
 #[test]
 fn for_each_has_an_independent_index_and_yields_in_normal_mode() {
