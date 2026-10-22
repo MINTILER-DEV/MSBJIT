@@ -1,11 +1,13 @@
 """Make a finite sub1k render benchmark without changing rendering quality.
 
-Only the MAIN ENGINE's outer forever becomes repeat N. No input is supplied,
-so the camera stays at its initialized position. All broadcast receivers must
-finish before MSBJIT reports completion; this measures whole frames rather
-than the project's instantaneous FPS variable. No project assets are copied
-into the repository. Run the ignored sub1k_complete_frames benchmark with
-MSBJIT_PEN_BENCH_PROJECT pointing at the resulting archive.
+The MAIN ENGINE's outer forever becomes repeat N. Its render broadcast waits
+for completion, and its frame-counter increment moves after the render call,
+so host warp preemption cannot count an aborted/restarted frame. No input is
+supplied; the camera stays at its initialized position (optionally overridden
+with --rot-x). Rendering procedures, quality settings and assets are unchanged.
+No project assets are copied into the repository. Run the ignored
+sub1k_complete_frames benchmark with MSBJIT_PEN_BENCH_PROJECT pointing at the
+resulting archive.
 """
 import argparse
 import json
@@ -24,6 +26,35 @@ def fixture(source, destination, frames, rot_x=None):
             raise ValueError("expected one MAIN ENGINE forever loop")
         loops[0]["opcode"] = "control_repeat"
         loops[0]["inputs"]["TIMES"] = [1, [4, str(frames)]]
+        engine_blocks = engine["blocks"]
+        increments = [(key, block) for key, block in engine_blocks.items()
+                      if block["opcode"] == "data_changevariableby"
+                      and block["fields"]["VARIABLE"][0] == "System: Frames Elapsed"]
+        if len(increments) != 1:
+            raise ValueError("expected one frame counter increment")
+        key, increment = increments[0]
+        engine_blocks[increment["parent"]]["next"] = increment["next"]
+        engine_blocks[increment["next"]]["parent"] = increment["parent"]
+        del engine_blocks[key]
+        renderer = next(t for t in project["targets"] if t["name"] == "E: Renderer")
+        hats = [b for b in renderer["blocks"].values()
+                if b["opcode"] == "event_whenbroadcastreceived"
+                and b["fields"]["BROADCAST_OPTION"][0] == "TICK: Render 3D"]
+        if len(hats) != 1:
+            raise ValueError("expected one render receiver")
+        call_key = hats[0]["next"]
+        call = renderer["blocks"][call_key]
+        if call["opcode"] != "procedures_call" or call["next"] is not None:
+            raise ValueError("expected one render procedure call")
+        call["next"] = key
+        increment["parent"], increment["next"] = call_key, None
+        renderer["blocks"][key] = increment
+        broadcasts = [b for b in engine_blocks.values()
+                      if b["opcode"] == "event_broadcast"
+                      and b["inputs"]["BROADCAST_INPUT"][1][1] == "TICK: Render 3D"]
+        if len(broadcasts) != 1:
+            raise ValueError("expected one render broadcast")
+        broadcasts[0]["opcode"] = "event_broadcastandwait"
         if rot_x is not None:
             resets = [b for b in engine["blocks"].values()
                       if b["opcode"] == "data_setvariableto"
