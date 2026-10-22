@@ -11,10 +11,17 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module, default_libcall_names};
 use std::collections::HashMap;
 use std::mem::offset_of;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+struct HelperProfile {
+    names: Vec<&'static str>,
+    counters: Box<[AtomicU64]>,
+}
 
 pub(crate) struct NativeProgram {
     module: Option<JITModule>,
     entry: cranelift_module::FuncId,
+    profile: Option<HelperProfile>,
 }
 impl NativeProgram {
     pub fn compile(program: &Program) -> Result<Self> {
@@ -114,6 +121,12 @@ impl NativeProgram {
         for (name, ptr, _, _) in &imports {
             jit.symbol(*name, *ptr);
         }
+        // Instrument only explicitly requested builds of the generated code.
+        // Ordinary runs emit no counter loads/stores and allocate no profile.
+        let profile = std::env::var_os("MSBJIT_PROFILE_HELPERS").map(|_| HelperProfile {
+            names: imports.iter().map(|(name, _, _, _)| *name).collect(),
+            counters: (0..imports.len()).map(|_| AtomicU64::new(0)).collect(),
+        });
         let mut module = JITModule::new(jit);
         let pointer = module.target_config().pointer_type();
         let mut ids = vec![];
@@ -142,8 +155,12 @@ impl NativeProgram {
             let vm = b.block_params(entry_block)[0];
             let funcs = ids
                 .into_iter()
-                .map(|(name, id)| (name, module.declare_func_in_func(id, b.func)))
+                .enumerate()
+                .map(|(slot, (name, id))| (name, (module.declare_func_in_func(id, b.func), slot)))
                 .collect();
+            let profile_address = profile
+                .as_ref()
+                .map(|p| b.ins().iconst(pointer, p.counters.as_ptr() as i64));
             let vars = b.ins().load(
                 pointer,
                 ir::MemFlags::trusted(),
@@ -190,6 +207,7 @@ impl NativeProgram {
                     .iter()
                     .map(|&bits| (bits as i64, program.values.decode(bits).to_number()))
                     .collect(),
+                profile: profile_address,
                 pointer,
                 funcs,
             };
@@ -389,6 +407,7 @@ impl NativeProgram {
         Ok(Self {
             module: Some(module),
             entry,
+            profile,
         })
     }
     pub fn execute(&self, vm: &mut Vm) {
@@ -407,6 +426,19 @@ impl NativeProgram {
 }
 impl Drop for NativeProgram {
     fn drop(&mut self) {
+        if let Some(profile) = &self.profile {
+            let mut counts: Vec<_> = profile
+                .names
+                .iter()
+                .zip(profile.counters.iter())
+                .map(|(name, count)| (*name, count.load(Ordering::Relaxed)))
+                .collect();
+            counts.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
+            eprintln!(
+                "JIT helper calls: {}",
+                serde_json::to_string(&counts).unwrap()
+            );
+        }
         let module = self.module.take().unwrap();
         // SAFETY: execute borrows self, so no generated call can be live here.
         unsafe { module.free_memory() };
@@ -423,7 +455,8 @@ struct Emitter<'a> {
     list_local: Vec<bool>,
     numeric_constants: HashMap<i64, f64>,
     pointer: ir::Type,
-    funcs: HashMap<&'static str, ir::FuncRef>,
+    funcs: HashMap<&'static str, (ir::FuncRef, usize)>,
+    profile: Option<ir::Value>,
 }
 impl Emitter<'_> {
     fn get_loop(&mut self, slot: usize) -> ir::Value {
@@ -647,9 +680,24 @@ impl Emitter<'_> {
         self.b.ins().iconst(types::I32, n as i64)
     }
     fn call(&mut self, name: &str, args: &[ir::Value]) -> Option<ir::Value> {
+        let (function, slot) = self.funcs[name];
+        if let Some(address) = self.profile {
+            // The worker is the only writer, and profiling is read only after
+            // execution ends. These non-atomic accesses never race with readers.
+            let count = self.b.ins().load(
+                types::I64,
+                ir::MemFlags::trusted(),
+                address,
+                (slot * 8) as i32,
+            );
+            let count = self.b.ins().iadd_imm(count, 1);
+            self.b
+                .ins()
+                .store(ir::MemFlags::trusted(), count, address, (slot * 8) as i32);
+        }
         let mut params = vec![self.vm];
         params.extend_from_slice(args);
-        let call = self.b.ins().call(self.funcs[name], &params);
+        let call = self.b.ins().call(function, &params);
         self.b.inst_results(call).first().copied()
     }
     fn num(&mut self, bits: ir::Value) -> ir::Value {
