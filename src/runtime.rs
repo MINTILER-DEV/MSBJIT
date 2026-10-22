@@ -1,14 +1,18 @@
 use crate::{
+    audio::AudioPlayer,
     input::{InputController, InputEvent, InputState},
     ir::{Hat, Program},
     jit::NativeProgram,
     lists::{ListView, RuntimeList},
     pen::{PenCanvas, PenState},
     project::Project,
+    sprite_cpu::CostumePixels,
     value::{ScratchValue, number},
 };
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use serde::Serialize;
+#[cfg(feature = "graphics")]
+use std::collections::HashMap;
 use std::{
     collections::{HashSet, VecDeque},
     sync::{
@@ -295,6 +299,11 @@ pub(crate) struct Vm {
     lists: Vec<RuntimeList>,
     list_views: Vec<ListView>,
     pens: Vec<PenState>,
+    audio: AudioPlayer,
+    #[cfg(feature = "graphics")]
+    costume_pixels: HashMap<(usize, usize), Arc<CostumePixels>>,
+    #[cfg(feature = "graphics")]
+    costume_bytes: usize,
     current: Fiber,
     sprites: Vec<SpriteState>,
     shared: Arc<SharedScene>,
@@ -315,16 +324,15 @@ pub(crate) struct Vm {
 impl Vm {
     fn new(
         project: Arc<Project>,
-        program: Program,
+        mut program: Program,
         options: RuntimeOptions,
         shared: Arc<SharedScene>,
     ) -> Self {
         let now = Instant::now();
-        let mut vars = program.initial_variables.clone();
+        let mut vars = std::mem::take(&mut program.initial_variables);
         let mut lists: Vec<_> = program
             .initial_lists
-            .iter()
-            .cloned()
+            .drain(..)
             .map(RuntimeList::new)
             .collect();
         let mut list_views: Vec<_> = lists.iter_mut().map(RuntimeList::view).collect();
@@ -344,6 +352,11 @@ impl Vm {
             lists,
             list_views,
             pens: vec![PenState::default(); project.targets.len()],
+            audio: AudioPlayer::default(),
+            #[cfg(feature = "graphics")]
+            costume_pixels: HashMap::new(),
+            #[cfg(feature = "graphics")]
+            costume_bytes: 0,
             current: Fiber::new(0, 0, 0, program.loop_slots),
             sprites: shared.snapshot(&project),
             project,
@@ -410,6 +423,7 @@ impl Vm {
             for event in events {
                 if matches!(event, InputEvent::Stop | InputEvent::Flag) {
                     fibers.clear();
+                    self.audio.stop();
                 }
                 if matches!(event, InputEvent::Flag) {
                     self.timer = Instant::now();
@@ -528,6 +542,7 @@ impl Vm {
                             }
                         }
                         Event::StopAll => {
+                            self.audio.stop();
                             for fiber in &mut fibers {
                                 fiber.done = true;
                             }
@@ -632,6 +647,82 @@ impl Vm {
     }
     fn value(&self, bits: u64) -> ScratchValue {
         self.program.values.decode(bits)
+    }
+    fn costume_pixels(&mut self, target: usize) -> Result<Option<Arc<CostumePixels>>> {
+        let Some(costume) = self.project.targets[target]
+            .costumes
+            .get(self.sprites[target].costume)
+        else {
+            return Ok(None);
+        };
+        #[cfg(feature = "graphics")]
+        {
+            let key = (target, self.sprites[target].costume);
+            if let Some(pixels) = self.costume_pixels.get(&key) {
+                return Ok(Some(pixels.clone()));
+            }
+            let data = self
+                .project
+                .assets
+                .get(&costume.md5ext)
+                .context("costume asset is missing")?;
+            let (w, h, rgba) = crate::render::decode(&costume.md5ext, data)?;
+            if self.costume_bytes + rgba.len() > 64 * 1024 * 1024 {
+                self.costume_pixels.clear();
+                self.costume_bytes = 0;
+            }
+            self.costume_bytes += rgba.len();
+            let pixels = Arc::new(CostumePixels::new(
+                w,
+                h,
+                rgba,
+                [costume.rotation_center_x, costume.rotation_center_y],
+                costume.bitmap_resolution,
+            ));
+            self.costume_pixels.insert(key, pixels.clone());
+            Ok(Some(pixels))
+        }
+        #[cfg(not(feature = "graphics"))]
+        {
+            let _ = costume;
+            anyhow::bail!(
+                "costume stamps and edge sensing require the graphics feature (enabled by default)"
+            )
+        }
+    }
+    fn stamp(&mut self) -> Result<()> {
+        if let Some(pixels) = self.costume_pixels(self.current.target)? {
+            let mut pen = self.shared.pen.lock().unwrap_or_else(|e| e.into_inner());
+            pixels.stamp(&self.sprites[self.current.target], &mut pen);
+        }
+        Ok(())
+    }
+    fn touching_edge(&mut self) -> Result<bool> {
+        Ok(self
+            .costume_pixels(self.current.target)?
+            .is_some_and(|p| p.touching_edge(&self.sprites[self.current.target])))
+    }
+    fn play_sound(&mut self, value: &ScratchValue) -> Result<()> {
+        if !self.interactive {
+            return Ok(());
+        }
+        let sounds = &self.project.targets[self.current.target].sounds;
+        let name = value.text();
+        let sound = sounds.iter().find(|s| s.name == name).or_else(|| {
+            let n = value.to_number();
+            (n.is_finite() && n >= 1.0)
+                .then(|| sounds.get((n as usize - 1) % sounds.len().max(1)))
+                .flatten()
+        });
+        if let Some(sound) = sound {
+            self.audio.play(
+                self.project
+                    .assets
+                    .get(&sound.md5ext)
+                    .context("sound asset is missing")?,
+            )?;
+        }
+        Ok(())
     }
     fn fail(&mut self, message: &str) {
         self.error = Some(message.into());
@@ -928,6 +1019,23 @@ pub(crate) extern "C" fn rt_binary(vm: &mut Vm, op: u32, a: u64, b: u64) -> u64 
 }
 pub(crate) extern "C" fn rt_unary(vm: &mut Vm, op: u32, a: u64) -> u64 {
     let a = vm.value(a);
+    if op == 18 {
+        let result = if a.text() == "_edge_" {
+            vm.touching_edge()
+        } else {
+            Err(anyhow!(
+                "touching-object currently supports the stage edge only"
+            ))
+        };
+        let touching = match result {
+            Ok(value) => value,
+            Err(error) => {
+                vm.fail(&error.to_string());
+                false
+            }
+        };
+        return vm.program.values.encode(ScratchValue::Boolean(touching));
+    }
     let n = a.to_number();
     let result = match op {
         0 => ScratchValue::Boolean(!a.to_bool()),
@@ -955,6 +1063,12 @@ pub(crate) extern "C" fn rt_unary(vm: &mut Vm, op: u32, a: u64) -> u64 {
     vm.program.values.encode(result)
 }
 pub(crate) extern "C" fn rt_state(vm: &mut Vm, field: u32) -> u64 {
+    if field == 10 {
+        let seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64());
+        return number((seconds - 946_684_800.0) / 86_400.0);
+    }
     if field == 9 {
         return vm
             .program
@@ -984,6 +1098,17 @@ pub(crate) extern "C" fn rt_state(vm: &mut Vm, field: u32) -> u64 {
 }
 pub(crate) extern "C" fn rt_action(vm: &mut Vm, op: u32, a: u64, b: u64) {
     let value = vm.value(a);
+    if op == 26 || op == 27 {
+        let result = if op == 26 {
+            vm.stamp()
+        } else {
+            vm.play_sound(&value)
+        };
+        if let Err(error) = result {
+            vm.fail(&error.to_string());
+        }
+        return;
+    }
     let n = value.to_number();
     let m = vm.value(b).to_number();
     let target = vm.current.target;

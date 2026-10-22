@@ -29,6 +29,8 @@ pub struct Target {
     #[serde(default)]
     pub costumes: Vec<Costume>,
     #[serde(default)]
+    pub sounds: Vec<Sound>,
+    #[serde(default)]
     pub current_costume: usize,
     #[serde(default)]
     pub x: f64,
@@ -68,6 +70,11 @@ pub struct Costume {
     pub rotation_center_y: f64,
     #[serde(default = "bitmap_resolution")]
     pub bitmap_resolution: f64,
+}
+#[derive(Debug, Deserialize)]
+pub struct Sound {
+    pub name: String,
+    pub md5ext: String,
 }
 fn bitmap_resolution() -> f64 {
     1.0
@@ -174,22 +181,27 @@ impl Project {
         )?;
         let mut total = 0;
         for target in &project.targets {
-            for costume in &target.costumes {
-                if project.assets.contains_key(&costume.md5ext) {
+            for asset in target
+                .costumes
+                .iter()
+                .map(|c| &c.md5ext)
+                .chain(target.sounds.iter().map(|s| &s.md5ext))
+            {
+                if project.assets.contains_key(asset) {
                     continue;
                 }
                 let mut data = Vec::new();
                 archive
-                    .by_name(&costume.md5ext)
-                    .with_context(|| format!("missing costume {}", costume.md5ext))?
+                    .by_name(asset)
+                    .with_context(|| format!("missing asset {asset}"))?
                     .take(MAX_ASSET + 1)
                     .read_to_end(&mut data)?;
                 total += data.len() as u64;
                 ensure!(
                     data.len() as u64 <= MAX_ASSET && total <= MAX_ASSETS,
-                    "costume assets exceed size limit"
+                    "project assets exceed size limit"
                 );
-                project.assets.insert(costume.md5ext.clone(), data);
+                project.assets.insert(asset.clone(), data);
             }
         }
         Ok(project)

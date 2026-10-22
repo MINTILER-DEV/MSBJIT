@@ -6,7 +6,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 #[derive(Debug, Clone)]
 pub(crate) enum Expr {
@@ -29,6 +29,7 @@ pub(crate) enum Op {
     RepeatInit(usize, Expr, usize),
     RepeatCheck(usize, usize, usize),
     RepeatDec(usize, usize),
+    ForEachCheck(usize, usize, Expr, usize, usize),
     Wait(Expr),
     Yield(usize),
     Broadcast(Expr, bool),
@@ -84,6 +85,7 @@ struct Lower<'a> {
     args: Vec<String>,
     active: HashSet<String>,
     depth: usize,
+    pending_procedures: BTreeSet<usize>,
 }
 impl Program {
     pub fn lower(project: &Project) -> Result<Self> {
@@ -112,6 +114,7 @@ impl Program {
             args: vec![],
             active: HashSet::new(),
             depth: 0,
+            pending_procedures: BTreeSet::new(),
         };
         for (target, t) in project.targets.iter().enumerate() {
             for (id, (name, items)) in &t.lists {
@@ -157,8 +160,10 @@ impl Program {
                 let names: Vec<String> = mutation_array(&proto.mutation, "argumentnames")?;
                 let defaults: Vec<ScratchValue> =
                     mutation_array(&proto.mutation, "argumentdefaults")?;
+                // Scratch indexes defaults only for declared parameter IDs.
+                // Edited projects can retain defaults for deleted parameters.
                 ensure!(
-                    args.len() == names.len() && args.len() == defaults.len(),
+                    args.len() == names.len() && args.len() <= defaults.len(),
                     "procedure {code}: inconsistent arguments"
                 );
                 let warp = proto.mutation["warp"]
@@ -180,15 +185,6 @@ impl Program {
                 definitions.push((target, id.clone(), proc_id));
             }
         }
-        for (target, id, proc_id) in definitions {
-            l.target = target;
-            l.args = l.program.procedures[proc_id].names.clone();
-            let start = l.block(&id)?.next.clone();
-            let body = l.chain(start.as_deref(), 0)?;
-            let entry = l.program.procedures[proc_id].entry;
-            l.program.nodes[entry].op = Op::Jump(body, false);
-        }
-        l.args.clear();
         for (target, t) in project.targets.iter().enumerate() {
             l.target = target;
             for (id, b) in &t.blocks {
@@ -213,6 +209,19 @@ impl Program {
                     .with_context(|| format!("{} script {id}", t.name))?;
                 l.program.scripts.push(Script { target, entry, hat });
             }
+        }
+        let mut compiled = HashSet::new();
+        while let Some(proc_id) = l.pending_procedures.pop_first() {
+            if !compiled.insert(proc_id) {
+                continue;
+            }
+            let (target, id, _) = &definitions[proc_id];
+            l.target = *target;
+            l.args = l.program.procedures[proc_id].names.clone();
+            let start = l.block(id)?.next.clone();
+            let body = l.chain(start.as_deref(), 0)?;
+            let entry = l.program.procedures[proc_id].entry;
+            l.program.nodes[entry].op = Op::Jump(body, false);
         }
         // Only string handles are GC roots; constants never change at runtime.
         l.program
@@ -350,12 +359,12 @@ impl Lower<'_> {
             }
             if opcode.starts_with("argument_reporter_") {
                 let name = b.field("VALUE")?;
-                return Ok(Expr::Argument(
-                    self.args
-                        .iter()
-                        .position(|a| a == name)
-                        .context("argument outside its custom block")?,
-                ));
+                return Ok(self
+                    .args
+                    .iter()
+                    .position(|a| a == name)
+                    .map(Expr::Argument)
+                    .unwrap_or_else(|| self.zero()));
             }
             let binary = match opcode.as_str() {
                 "operator_add" => Some((0, "NUM1", "NUM2")),
@@ -384,6 +393,7 @@ impl Lower<'_> {
                 ));
             }
             let unary = match opcode.as_str() {
+                "sensing_touchingobject" => Some((18, "TOUCHINGOBJECTMENU")),
                 "operator_not" => Some((0, "OPERAND")),
                 "operator_length" => Some((1, "STRING")),
                 "operator_round" => Some((2, "NUM")),
@@ -423,6 +433,15 @@ impl Lower<'_> {
                 "sensing_mousex" => 7,
                 "sensing_mousey" => 8,
                 "sensing_mousedown" => 9,
+                "sensing_dayssince2000" => 10,
+                "sensing_touchingobjectmenu" => {
+                    return Ok(
+                        self.constant(ScratchValue::String(b.field("TOUCHINGOBJECTMENU")?.into()))
+                    );
+                }
+                "sound_sounds_menu" => {
+                    return Ok(self.constant(ScratchValue::String(b.field("SOUND_MENU")?.into())));
+                }
                 "sensing_keyoptions" => {
                     return Ok(self.constant(ScratchValue::String(b.field("KEY_OPTION")?.into())));
                 }
@@ -549,6 +568,21 @@ impl Lower<'_> {
                 self.program.nodes[back].op = Op::Jump(body, true);
                 Op::Jump(body, false)
             }
+            "control_for_each" => {
+                let slot = self.program.loop_slots;
+                self.program.loop_slots += 1;
+                let check = self.add(Op::Return, 0)?;
+                let back = self.add(Op::Jump(check, true), check)?;
+                let body = self.chain(self.block_input(b, "SUBSTACK")?.as_deref(), back)?;
+                self.program.nodes[check].op = Op::ForEachCheck(
+                    slot,
+                    self.var_field(b)?,
+                    self.expr_input(b, "VALUE")?,
+                    body,
+                    next,
+                );
+                Op::RepeatInit(slot, self.zero(), check)
+            }
             "control_repeat_until" | "control_wait_until" => {
                 let check = self.add(Op::Return, 0)?;
                 let back = self.add(
@@ -594,10 +628,12 @@ impl Lower<'_> {
                 let code = b.mutation["proccode"]
                     .as_str()
                     .context("missing call procedure code")?;
-                let proc_id = *self
-                    .procs
-                    .get(&(self.target, code.into()))
-                    .with_context(|| format!("undefined custom block {code}"))?;
+                let Some(&proc_id) = self.procs.get(&(self.target, code.into())) else {
+                    // Scratch treats a call whose definition was removed as a
+                    // no-op, including when a stack was copied between sprites.
+                    return Ok(next);
+                };
+                self.pending_procedures.insert(proc_id);
                 let params = self.program.procedures[proc_id].args.clone();
                 let defaults = self.program.procedures[proc_id].defaults.clone();
                 let mut args = vec![];
@@ -664,6 +700,8 @@ impl Lower<'_> {
             ),
             "pen_setPenColorToColor" => Op::Action(24, self.expr_input(b, "COLOR")?, self.zero()),
             "pen_changePenSizeBy" => Op::Action(25, self.expr_input(b, "SIZE")?, self.zero()),
+            "pen_stamp" => Op::Action(26, self.zero(), self.zero()),
+            "sound_play" => Op::Action(27, self.expr_input(b, "SOUND_MENU")?, self.zero()),
             s => bail!("unsupported command {s}"),
         };
         self.add(op, next)

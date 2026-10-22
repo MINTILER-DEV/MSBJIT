@@ -490,7 +490,7 @@ impl Renderer {
         Ok(rgba)
     }
 }
-fn decode(name: &str, data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
+pub(crate) fn decode(name: &str, data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
     if name.to_ascii_lowercase().ends_with(".svg") {
         let mut options = resvg::usvg::Options::default();
         options.image_href_resolver.resolve_string = Box::new(|_, _| None);

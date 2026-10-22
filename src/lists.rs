@@ -17,11 +17,13 @@ pub(crate) struct ListView {
 impl RuntimeList {
     pub fn new(values: Vec<u64>) -> Self {
         let mut list = Self {
-            values: Vec::with_capacity(values.len()),
+            values,
             strings: HashMap::new(),
         };
-        for value in values {
-            list.push(value);
+        for &value in &list.values {
+            if value & 0xffff_0000_0000_0000 == STRING_TAG {
+                *list.strings.entry(value).or_default() += 1;
+            }
         }
         list
     }

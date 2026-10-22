@@ -215,6 +215,95 @@ fn custom_block_arguments_and_return() {
     assert_eq!(value(&r, "n"), &ScratchValue::Number(18.0));
 }
 #[test]
+fn custom_blocks_ignore_surplus_defaults_and_stale_call_inputs() {
+    for supplied in [false, true] {
+        let mut blocks = json!({
+            "hat":{"opcode":"event_whenflagclicked","topLevel":true,"next":"call"},
+            "call":{"opcode":"procedures_call","mutation":{"proccode":"save %s","argumentids":"[\"a\"]"},"inputs":{"old_parameter":[1,[4,"999"]]}},
+            "def":{"opcode":"procedures_definition","topLevel":true,"inputs":{"custom_block":[1,"proto"]},"next":"set"},
+            "proto":{"opcode":"procedures_prototype","mutation":{"proccode":"save %s","argumentids":"[\"a\"]","argumentnames":"[\"amount\"]","argumentdefaults":"[17,999]","warp":"true"}},
+            "arg":{"opcode":"argument_reporter_string_number","fields":{"VALUE":["amount",null]}},
+            "set":{"opcode":"data_setvariableto","fields":{"VARIABLE":["counter","n"]},"inputs":{"VALUE":[2,"arg"]}}
+        });
+        if supplied {
+            blocks["call"]["inputs"]["a"] = json!([1, [4, "7"]]);
+        }
+        let report = run(blocks, true);
+        assert_eq!(
+            value(&report, "n"),
+            &ScratchValue::Number(if supplied { 7.0 } else { 17.0 })
+        );
+    }
+}
+#[test]
+fn missing_custom_block_definitions_do_not_abort_the_script() {
+    let report = run(
+        json!({
+            "hat":{"opcode":"event_whenflagclicked","topLevel":true,"next":"call"},
+            "call":{"opcode":"procedures_call","mutation":{"proccode":"removed debug log %s"},"next":"set"},
+            "set":{"opcode":"data_setvariableto","fields":{"VARIABLE":["counter","n"]},"inputs":{"VALUE":[1,[4,"42"]]}}
+        }),
+        true,
+    );
+    assert_eq!(value(&report, "n"), &ScratchValue::Number(42.0));
+}
+#[test]
+fn unused_custom_block_bodies_are_not_compiled() {
+    let report = run(
+        json!({
+            "hat":{"opcode":"event_whenflagclicked","topLevel":true,"next":"set"},
+            "set":{"opcode":"data_setvariableto","fields":{"VARIABLE":["counter","n"]},"inputs":{"VALUE":[1,[4,"42"]]}},
+            "def":{"opcode":"procedures_definition","topLevel":true,"inputs":{"custom_block":[1,"proto"]},"next":"bad"},
+            "proto":{"opcode":"procedures_prototype","mutation":{"proccode":"unused","argumentids":"[]","argumentnames":"[]","argumentdefaults":"[]","warp":"true"}},
+            "bad":{"opcode":"unsupported_unused_extension"}
+        }),
+        true,
+    );
+    assert_eq!(value(&report, "n"), &ScratchValue::Number(42.0));
+}
+
+#[test]
+fn for_each_has_an_independent_index_and_yields_in_normal_mode() {
+    for turbo in [false, true] {
+        let report = run(
+            json!({
+                "hat":{"opcode":"event_whenflagclicked","topLevel":true,"next":"loop"},
+                "loop":{"opcode":"control_for_each","fields":{"VARIABLE":["counter","n"]},"inputs":{"VALUE":[1,[4,"2.5"]],"SUBSTACK":[2,"append"]}},
+                "append":{"opcode":"data_setvariableto","fields":{"VARIABLE":["text","s"]},"inputs":{"VALUE":[2,"joined"]},"next":"change"},
+                "joined":{"opcode":"operator_join","inputs":{"STRING1":[3,[12,"text","s"],[10,""]],"STRING2":[3,[12,"counter","n"],[4,"0"]]}},
+                "change":{"opcode":"data_setvariableto","fields":{"VARIABLE":["counter","n"]},"inputs":{"VALUE":[1,[4,"999"]]}}
+            }),
+            turbo,
+        );
+        assert_eq!(value(&report, "s"), &ScratchValue::String("123".into()));
+        assert_eq!(value(&report, "n"), &ScratchValue::Number(999.0));
+        assert_eq!(report.ticks > 1, !turbo);
+    }
+}
+
+#[test]
+fn days_since_2000_uses_the_wall_clock_and_missing_arguments_return_zero() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    let report = run(
+        json!({
+            "hat":{"opcode":"event_whenflagclicked","topLevel":true,"next":"set"},
+            "set":{"opcode":"data_setvariableto","fields":{"VARIABLE":["counter","n"]},"inputs":{"VALUE":[2,"days"]},"next":"argument"},
+            "days":{"opcode":"sensing_dayssince2000"},
+            "argument":{"opcode":"data_setvariableto","fields":{"VARIABLE":["text","s"]},"inputs":{"VALUE":[2,"missing"]}},
+            "missing":{"opcode":"argument_reporter_string_number","fields":{"VALUE":["removed parameter",null]}}
+        }),
+        true,
+    );
+    let ScratchValue::Number(days) = value(&report, "n") else {
+        panic!("expected day count");
+    };
+    assert!((*days - (now - 946_684_800.0) / 86_400.0).abs() < 0.001);
+    assert_eq!(value(&report, "s"), &ScratchValue::Number(0.0));
+}
+#[test]
 fn live_scene_is_available_without_locking_execution() {
     let p = Arc::new(project(json!({
         "hat":{"opcode":"event_whenflagclicked","topLevel":true,"next":"move"},

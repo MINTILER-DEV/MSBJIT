@@ -247,6 +247,29 @@ impl NativeProgram {
                         e.call("loop_dec", &[slot]);
                         e.boundary(*to, blocks[*to], exit);
                     }
+                    Op::ForEachCheck(slot, variable, limit, yes, no) => {
+                        let limit = e.expr(limit);
+                        let limit = e.num(limit);
+                        let slot = e.i32(*slot);
+                        let index = e.call("loop_get", &[slot]).unwrap();
+                        let more =
+                            e.b.ins()
+                                .fcmp(ir::condcodes::FloatCC::LessThan, index, limit);
+                        let advance = e.b.create_block();
+                        e.b.ins().brif(more, advance, &[], blocks[*no], &[]);
+                        e.b.switch_to_block(advance);
+                        let one = e.b.ins().f64const(1.0);
+                        let index = e.b.ins().fadd(index, one);
+                        e.call("loop_set", &[slot, index]);
+                        let value = e.bits(index);
+                        e.b.ins().store(
+                            ir::MemFlags::trusted(),
+                            value,
+                            e.vars,
+                            (*variable * 8) as i32,
+                        );
+                        e.b.ins().jump(blocks[*yes], &[]);
+                    }
                     Op::Yield(to) => {
                         let zero = e.b.ins().f64const(0.0);
                         let pc = e.i32(*to);
