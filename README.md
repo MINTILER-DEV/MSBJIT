@@ -45,6 +45,8 @@ Use `--display` to request a window explicitly, including for asset-free JSON pr
 
 The loader accepts up to 256 MiB of decompressed project JSON by default, for both `.sb3` archives and standalone `.json` files. Compressed archive size can be much smaller than its JSON. For larger projects, pass `--max-project-mib 512` (1–4096 MiB supported). This changes the JSON limit; costume asset limits remain separate. Large list data also requires memory for its parsed and runtime representations.
 
+Set `MSBJIT_LARGE_PROJECT` to an external large `.sb3` or `.json` path to include it in the opt-in loader regression (`cargo test --lib external_large_project_loads -- --ignored`). This checks loading; block compilation and project execution have their own compatibility requirements. The external fixture is skipped when its path is not supplied.
+
 ## Execution model
 
 The loader reads bounded ZIP entries directly without extracting them. Variables resolve by Scratch ID with stage fallback. Block graphs are checked for missing links, cycles, and excessive depth. Active unsupported commands/reporters and event hats produce errors with block context; detached workspace stacks are ignored.

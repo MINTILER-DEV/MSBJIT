@@ -303,7 +303,10 @@ mod tests {
     #[test]
     #[ignore = "requires MSBJIT_LARGE_PROJECT pointing to an external large project"]
     fn external_large_project_loads() -> Result<()> {
-        let path = std::env::var("MSBJIT_LARGE_PROJECT").context("set MSBJIT_LARGE_PROJECT")?;
+        let Ok(path) = std::env::var("MSBJIT_LARGE_PROJECT") else {
+            eprintln!("Skipping external project fixture: set MSBJIT_LARGE_PROJECT");
+            return Ok(());
+        };
         let project = Project::load(path)?;
         assert!(!project.targets.is_empty());
         eprintln!("Loaded {} targets", project.targets.len());
