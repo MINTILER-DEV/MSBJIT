@@ -1,0 +1,65 @@
+{
+  "platform": "Windows-11-10.0.26200-SP0",
+  "source_sha256": "a73162871c9b59a861dd9531cb325704bb95e63d58067700c1316fa34776840d",
+  "fixture": "raytrace-frame-benchmark.one-frame.sb3",
+  "description": "Compare complete ray-traced frames, excluding the project's busy-wait intro.\n\nThe saved fixture starts the existing 'start' receiver with the green flag,\ndisables Intro scripts, and replaces the outer forever with repeat 1. Rendering\nprocedures, assets, resolution, shadows, and quality settings are unchanged.\n",
+  "samples": {
+    "before": [
+      {
+        "elapsed": 20.669984499999998,
+        "wall": 21.03193490000558,
+        "steps": 109503588,
+        "frames": 1.0
+      },
+      {
+        "elapsed": 21.2584571,
+        "wall": 21.575404300005175,
+        "steps": 110536462,
+        "frames": 1.0
+      },
+      {
+        "elapsed": 20.6514967,
+        "wall": 20.998095399991143,
+        "steps": 110040383,
+        "frames": 1.0
+      }
+    ],
+    "after": [
+      {
+        "elapsed": 3.8877916,
+        "wall": 5.4726158999837935,
+        "steps": 110405494,
+        "frames": 1.0
+      },
+      {
+        "elapsed": 4.0441186,
+        "wall": 4.362691799993627,
+        "steps": 109914764,
+        "frames": 1.0
+      },
+      {
+        "elapsed": 5.3648803,
+        "wall": 5.670737700012978,
+        "steps": 110626039,
+        "frames": 1.0
+      }
+    ]
+  },
+  "median_seconds": {
+    "before": 20.669984499999998,
+    "after": 4.0441186
+  },
+  "speedup": 5.111122235633742,
+  "cpu": "Intel Core i5-8300H @ 2.30GHz",
+  "versions": {
+    "before": "0f47f98",
+    "after": "ab03297"
+  },
+  "build": "cargo build --release (default desktop features); helper profiling disabled",
+  "settings": {
+    "resolution": 1,
+    "raytracer_quality": 1,
+    "shadows": 1
+  },
+  "notes": "Three alternating complete-frame runs per executable. Includes the original 0.25-second startup wait; excludes JIT compilation from elapsed. Procedural noise is randomized independently in each run. Headless computation, not displayed FPS."
+}
