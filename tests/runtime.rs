@@ -556,6 +556,61 @@ fn scratch_coercions() {
 }
 
 #[test]
+fn constant_numeric_coercion_preserves_assignment_and_string_semantics() {
+    for literal in [
+        "",
+        "  ",
+        "0x10",
+        "-2.5",
+        "NaN",
+        "nonsense",
+        "false",
+        "Infinity",
+        "-Infinity",
+    ] {
+        let r = run(
+            json!({
+                "hat":{"opcode":"event_whenflagclicked","topLevel":true,"next":"save"},
+                "save":{"opcode":"data_setvariableto","fields":{"VARIABLE":["text","s"]},"inputs":{"VALUE":[1,[10,literal]]},"next":"arithmetic"},
+                "arithmetic":{"opcode":"data_setvariableto","fields":{"VARIABLE":["counter","n"]},"inputs":{"VALUE":[2,"sum"]}},
+                "sum":{"opcode":"operator_add","inputs":{"NUM1":[1,[10,literal]],"NUM2":[1,[10,"2"]]}}
+            }),
+            true,
+        );
+        assert_eq!(value(&r, "s").text(), literal);
+        assert_eq!(
+            value(&r, "n").to_number(),
+            ScratchValue::String(literal.into()).to_number() + 2.0,
+            "{literal:?}"
+        );
+    }
+}
+
+#[test]
+fn recursive_procedure_loops_survive_calls_returns_and_scheduler_resumption() {
+    let blocks = json!({
+        "hat":{"opcode":"event_whenflagclicked","topLevel":true,"next":"rootLoop"},
+        "rootLoop":{"opcode":"control_repeat","inputs":{"TIMES":[1,[4,"2"]],"SUBSTACK":[2,"rootCall"]}},
+        "rootCall":{"opcode":"procedures_call","mutation":{"proccode":"visit %n","argumentids":"[\"depth\"]"},"inputs":{"depth":[1,[10,"3"]]}},
+        "def":{"opcode":"procedures_definition","topLevel":true,"inputs":{"custom_block":[1,"proto"]},"next":"recursiveLoop"},
+        "proto":{"opcode":"procedures_prototype","mutation":{"proccode":"visit %n","argumentids":"[\"depth\"]","argumentnames":"[\"depth\"]","argumentdefaults":"[1]","warp":"false"}},
+        "recursiveLoop":{"opcode":"control_repeat","inputs":{"TIMES":[1,[10,"2"]],"SUBSTACK":[2,"wait"]}},
+        "wait":{"opcode":"control_wait","inputs":{"DURATION":[1,[4,"0"]]},"next":"increment"},
+        "increment":{"opcode":"data_changevariableby","fields":{"VARIABLE":["counter","n"]},"inputs":{"VALUE":[2,"depth"]},"next":"if"},
+        "depth":{"opcode":"argument_reporter_string_number","fields":{"VALUE":["depth",null]}},
+        "if":{"opcode":"control_if","inputs":{"CONDITION":[2,"more"],"SUBSTACK":[2,"recurse"]}},
+        "more":{"opcode":"operator_gt","inputs":{"OPERAND1":[2,"depth"],"OPERAND2":[1,[4,"1"]]}},
+        "recurse":{"opcode":"procedures_call","mutation":{"proccode":"visit %n","argumentids":"[\"depth\"]"},"inputs":{"depth":[2,"minus"]}},
+        "minus":{"opcode":"operator_subtract","inputs":{"NUM1":[2,"depth"],"NUM2":[1,[4,"1"]]}}
+    });
+    for turbo in [false, true] {
+        let r = run(blocks.clone(), turbo);
+        assert!(!r.interrupted);
+        assert_eq!(value(&r, "n").to_number(), 44.0);
+    }
+}
+
+#[test]
 fn compact_variable_and_list_reporters_load_and_execute() {
     let p: Project = serde_json::from_value(json!({"targets":[{
         "name":"Stage","isStage":true,"variables":{"n":["n",0],"s":["s","hello"]},

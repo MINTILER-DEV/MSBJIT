@@ -24,6 +24,16 @@ def workload(kind):
                               "fields": {"BROADCAST_OPTION": ["ping", "message"]}, "next": "inc"}
         if kind.endswith("ram"):
             lists = {"ram": ["RAM", [0] * 65536], "hdd": ["HDD", [0] * 65536]}
+    elif kind == "procedure-loops":
+        blocks["work"] = {"opcode": "procedures_call", "mutation": {"proccode": "accumulate"}}
+        blocks["definition"] = {"opcode": "procedures_definition", "topLevel": True,
+                                "inputs": {"custom_block": [1, "prototype"]}, "next": "repeat"}
+        blocks["prototype"] = {"opcode": "procedures_prototype", "mutation": {
+            "proccode": "accumulate", "argumentids": "[]", "argumentnames": "[]",
+            "argumentdefaults": "[]", "warp": "true"}}
+        blocks["repeat"] = {"opcode": "control_repeat", "inputs": {
+            "TIMES": [1, [10, "4"]], "SUBSTACK": [2, "inc"]}}
+        blocks["inc"]["inputs"]["VALUE"] = [1, [10, "1"]]
     elif kind == "numeric-list":
         lists = {"ram": ["RAM", [0] * 65536]}
         blocks["work"] = {"opcode": "data_replaceitemoflist", "fields": {"LIST": ["RAM", "ram"]},
@@ -46,22 +56,26 @@ def main():
     parser.add_argument("after", type=Path)
     parser.add_argument("--seconds", type=float, default=2)
     parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--project", type=Path, help="Also measure the external hardware emulator (CLK)")
+    parser.add_argument("--project", type=Path, help="Also measure an external Scratch project")
+    parser.add_argument("--project-counter", default="CLK", help="External progress variable name, or 'steps' for native instruction throughput")
+    parser.add_argument("--project-only", action="store_true", help="Skip synthetic workloads (requires --project)")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.seconds <= 0 or args.repeats < 1:
         parser.error("seconds and repeats must be positive")
+    if args.project_only and not args.project:
+        parser.error("--project-only requires --project")
     results = {"platform": platform.platform(), "seconds": args.seconds, "repeats": args.repeats,
                "executables": {k: str(getattr(args, k).resolve()) for k in ("before", "after")},
                "workloads": {}}
     with tempfile.TemporaryDirectory(prefix="msbjit-bench-") as temp:
         projects = {}
-        for name in ("arithmetic", "numeric-list", "broadcast-empty", "broadcast-ram"):
+        for name in (() if args.project_only else ("arithmetic", "procedure-loops", "numeric-list", "broadcast-empty", "broadcast-ram")):
             path = Path(temp) / (name + ".json")
             path.write_text(json.dumps(workload(name)), encoding="utf-8")
             projects[name] = path
         if args.project:
-            projects["hardware-emulator"] = args.project.resolve()
+            projects["external-project"] = args.project.resolve()
         for name, path in projects.items():
             samples = {"before": [], "after": []}
             for repeat in range(args.repeats):
@@ -74,8 +88,9 @@ def main():
                                              timeout=max(120, args.seconds + 60))
                     wall = time.perf_counter() - start
                     report = json.loads(process.stdout)
-                    counter = "CLK" if name == "hardware-emulator" else "calls"
-                    count = next(v["value"] for v in report["variables"] if v["name"] == counter)
+                    counter = args.project_counter if name == "external-project" else "calls"
+                    count = report["steps"] if counter == "steps" else float(next(
+                        v["value"] for v in report["variables"] if v["name"] == counter))
                     samples[version].append({"count": count, "steps": report["steps"],
                                              "elapsed": report["elapsed_seconds"], "wall": wall,
                                              "count_per_second": count / report["elapsed_seconds"]})

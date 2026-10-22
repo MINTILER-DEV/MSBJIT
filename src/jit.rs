@@ -62,19 +62,6 @@ impl NativeProgram {
             ),
             ("return", rt_return as *const u8, vec![], Some(types::I32)),
             (
-                "loop_set",
-                rt_loop_set as *const u8,
-                vec![types::I32, types::F64],
-                None,
-            ),
-            (
-                "loop_get",
-                rt_loop_get as *const u8,
-                vec![types::I32],
-                Some(types::F64),
-            ),
-            ("loop_dec", rt_loop_dec as *const u8, vec![types::I32], None),
-            (
                 "wait",
                 rt_wait as *const u8,
                 vec![types::F64, types::I32],
@@ -198,6 +185,11 @@ impl NativeProgram {
                     .iter()
                     .map(|(target, _, _)| *target != program.stage)
                     .collect(),
+                numeric_constants: program
+                    .constants
+                    .iter()
+                    .map(|&bits| (bits as i64, program.values.decode(bits).to_number()))
+                    .collect(),
                 pointer,
                 funcs,
             };
@@ -266,13 +258,19 @@ impl NativeProgram {
                     Op::RepeatInit(slot, count, to) => {
                         let count = e.expr(count);
                         let count = e.num(count);
-                        let slot = e.i32(*slot);
-                        e.call("loop_set", &[slot, count]);
+                        let half = e.b.ins().f64const(0.5);
+                        let rounded = e.b.ins().fadd(count, half);
+                        let rounded = e.b.ins().floor(rounded);
+                        let zero = e.b.ins().f64const(0.0);
+                        let positive =
+                            e.b.ins()
+                                .fcmp(ir::condcodes::FloatCC::GreaterThan, rounded, zero);
+                        let count = e.b.ins().select(positive, rounded, zero);
+                        e.set_loop(*slot, count);
                         e.b.ins().jump(blocks[*to], &[]);
                     }
                     Op::RepeatCheck(slot, yes, no) => {
-                        let slot = e.i32(*slot);
-                        let count = e.call("loop_get", &[slot]).unwrap();
+                        let count = e.get_loop(*slot);
                         let zero = e.b.ins().f64const(0.0);
                         let positive =
                             e.b.ins()
@@ -281,15 +279,16 @@ impl NativeProgram {
                             .brif(positive, blocks[*yes], &[], blocks[*no], &[]);
                     }
                     Op::RepeatDec(slot, to) => {
-                        let slot = e.i32(*slot);
-                        e.call("loop_dec", &[slot]);
+                        let count = e.get_loop(*slot);
+                        let one = e.b.ins().f64const(1.0);
+                        let count = e.b.ins().fsub(count, one);
+                        e.set_loop(*slot, count);
                         e.boundary(*to, blocks[*to], exit);
                     }
                     Op::ForEachCheck(slot, variable, limit, yes, no) => {
                         let limit = e.expr(limit);
                         let limit = e.num(limit);
-                        let slot = e.i32(*slot);
-                        let index = e.call("loop_get", &[slot]).unwrap();
+                        let index = e.get_loop(*slot);
                         let more =
                             e.b.ins()
                                 .fcmp(ir::condcodes::FloatCC::LessThan, index, limit);
@@ -298,7 +297,7 @@ impl NativeProgram {
                         e.b.switch_to_block(advance);
                         let one = e.b.ins().f64const(1.0);
                         let index = e.b.ins().fadd(index, one);
-                        e.call("loop_set", &[slot, index]);
+                        e.set_loop(*slot, index);
                         let value = e.bits(index);
                         let vars = e.variable_base(*variable);
                         e.b.ins().store(
@@ -358,10 +357,11 @@ impl NativeProgram {
                                 );
                             }
                         }
+                        let callee = blocks[program.procedures[*proc].entry];
                         let proc = e.i32(*proc);
                         let pc = e.i32(node.next);
                         let stop = e.call("call", &[proc, pc]).unwrap();
-                        e.b.ins().brif(stop, exit, &[], dispatch, &[]);
+                        e.b.ins().brif(stop, exit, &[], callee, &[]);
                     }
                     Op::Return | Op::Stop(1) => {
                         let stop = e.call("return", &[]).unwrap();
@@ -421,10 +421,28 @@ struct Emitter<'a> {
     local_lists: ir::Value,
     variable_local: Vec<bool>,
     list_local: Vec<bool>,
+    numeric_constants: HashMap<i64, f64>,
     pointer: ir::Type,
     funcs: HashMap<&'static str, ir::FuncRef>,
 }
 impl Emitter<'_> {
+    fn get_loop(&mut self, slot: usize) -> ir::Value {
+        // Calls, returns, and scheduler resumption rebind this pointer to the
+        // active procedure frame. Do not cache it across a custom-block call.
+        let loops = self.load(self.pointer, offset_of!(JitState, loops));
+        self.b.ins().load(
+            types::F64,
+            ir::MemFlags::trusted(),
+            loops,
+            (slot * 8) as i32,
+        )
+    }
+    fn set_loop(&mut self, slot: usize, value: ir::Value) {
+        let loops = self.load(self.pointer, offset_of!(JitState, loops));
+        self.b
+            .ins()
+            .store(ir::MemFlags::trusted(), value, loops, (slot * 8) as i32);
+    }
     fn variable_base(&self, slot: usize) -> ir::Value {
         if self.variable_local[slot] {
             self.local_vars
@@ -635,6 +653,19 @@ impl Emitter<'_> {
         self.b.inst_results(call).first().copied()
     }
     fn num(&mut self, bits: ir::Value) -> ir::Value {
+        // Numeric strings are common in Scratch literals. Coerce immutable
+        // constants once during compilation, while preserving their original
+        // tagged value in assignments, comparisons, and string operators.
+        if let ir::ValueDef::Result(inst, _) = self.b.func.dfg.value_def(bits)
+            && let ir::InstructionData::UnaryImm {
+                opcode: ir::Opcode::Iconst,
+                imm,
+                ..
+            } = self.b.func.dfg.insts[inst]
+            && let Some(&number) = self.numeric_constants.get(&imm.bits())
+        {
+            return self.b.ins().f64const(number);
+        }
         // Numbers take a native fast path; only boxed strings/booleans cross
         // the host ABI for Scratch coercion.
         let tag = self.b.ins().band_imm(bits, 0xfffe_0000_0000_0000u64 as i64);

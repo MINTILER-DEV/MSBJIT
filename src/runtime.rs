@@ -344,6 +344,7 @@ pub(crate) struct JitState {
     pub yield_on_loop: u32,
     pub local_vars: *mut u64,
     pub local_lists: *mut ListView,
+    pub loops: *mut f64,
 }
 #[repr(C)]
 pub(crate) struct Vm {
@@ -407,6 +408,7 @@ impl Vm {
                 yield_on_loop: 0,
                 local_vars: vars.as_mut_ptr(),
                 local_lists: list_views.as_mut_ptr(),
+                loops: std::ptr::null_mut(),
             },
             input: InputState::default(),
             interactive: false,
@@ -768,6 +770,7 @@ impl Vm {
                 self.slice_start = Instant::now();
                 self.warp_start = self.current.warp().then(Instant::now);
                 self.jit.args = self.current.frames.last().unwrap().args.as_ptr();
+                self.jit.loops = self.current.frames.last_mut().unwrap().loops.as_mut_ptr();
                 self.jit.budget = 0;
                 self.jit.pc = self.current.pc as u32;
                 self.jit.yield_on_loop = u32::from(!self.current.warp() && !self.options.turbo);
@@ -1234,6 +1237,7 @@ pub(crate) extern "C" fn rt_call(vm: &mut Vm, procedure: u32, next: u32) -> u32 
     frame.loops.resize(vm.program.loop_slots, 0.0);
     frame.loops.fill(0.0);
     vm.jit.args = frame.args.as_ptr();
+    vm.jit.loops = frame.loops.as_mut_ptr();
     vm.current.frames.push(frame);
     0
 }
@@ -1250,19 +1254,11 @@ pub(crate) extern "C" fn rt_return(vm: &mut Vm) -> u32 {
             vm.jit.budget = 0;
         }
         vm.jit.args = vm.current.frames.last().unwrap().args.as_ptr();
+        vm.jit.loops = vm.current.frames.last_mut().unwrap().loops.as_mut_ptr();
         frame.args.clear();
         vm.spare_frames.push(frame);
         0
     }
-}
-pub(crate) extern "C" fn rt_loop_set(vm: &mut Vm, slot: u32, count: f64) {
-    vm.current.frames.last_mut().unwrap().loops[slot as usize] = (count + 0.5).floor().max(0.0);
-}
-pub(crate) extern "C" fn rt_loop_get(vm: &mut Vm, slot: u32) -> f64 {
-    vm.current.frames.last().unwrap().loops[slot as usize]
-}
-pub(crate) extern "C" fn rt_loop_dec(vm: &mut Vm, slot: u32) {
-    vm.current.frames.last_mut().unwrap().loops[slot as usize] -= 1.0;
 }
 pub(crate) extern "C" fn rt_wait(vm: &mut Vm, seconds: f64, next: u32) {
     let seconds = if seconds.is_nan() {
