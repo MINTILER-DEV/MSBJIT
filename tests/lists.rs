@@ -45,6 +45,26 @@ fn value<'a>(r: &'a RunReport, id: &str) -> &'a ScratchValue {
     &r.variables.iter().find(|v| v.id == id).unwrap().value
 }
 #[test]
+fn native_numeric_string_cache_and_large_handle_fallback_preserve_coercions() {
+    let r = run(
+        vec![set("out", "sum"), set("n", "boolsum"), set("bad", "last")],
+        json!({
+            "sum":{"opcode":"operator_add","inputs":{"NUM1":[2,"first"],"NUM2":[2,"last"]}},
+            "first":list("data_itemoflist",json!({"INDEX":[1,[10," 1.9 "]]})),
+            "last":list("data_itemoflist",json!({"INDEX":[1,[10,"last"]]})),
+            "boolsum":{"opcode":"operator_add","inputs":{"NUM1":[2,"bool"],"NUM2":[1,[4,"5"]]}},
+            "bool":{"opcode":"operator_equals","inputs":{"OPERAND1":[1,[10,"1"]],"OPERAND2":[1,[10,"1"]]}}
+        }),
+        json!((0..65_538).map(|i| i.to_string()).collect::<Vec<_>>()),
+        true,
+    );
+    assert_eq!(value(&r, "out"), &ScratchValue::Number(65_537.));
+    assert_eq!(value(&r, "n"), &ScratchValue::Number(6.));
+    assert_eq!(value(&r, "bad"), &ScratchValue::String("65537".into()));
+    assert_eq!(r.lists[0].items[0], ScratchValue::String("0".into()));
+}
+
+#[test]
 fn native_list_views_follow_reallocations_and_string_transitions() {
     let mut commands = vec![];
     for i in 0..40 {

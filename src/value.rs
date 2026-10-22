@@ -85,12 +85,26 @@ pub(crate) fn number(n: f64) -> u64 {
         n.to_bits()
     }
 }
-#[derive(Default)]
+/// A bounded, stable-address coercion table for native loads. Larger string
+/// handles retain the helper fallback; text and comparison semantics stay intact.
+pub(crate) const NUMERIC_CACHE_LEN: usize = 65_536;
 pub(crate) struct Values {
     strings: Vec<Option<InternedString>>,
     interned: HashMap<String, usize>,
     free: Vec<usize>,
     dirty: bool,
+    numeric_cache: Box<[f64]>,
+}
+impl Default for Values {
+    fn default() -> Self {
+        Self {
+            strings: Vec::new(),
+            interned: HashMap::new(),
+            free: Vec::new(),
+            dirty: false,
+            numeric_cache: vec![0.; NUMERIC_CACHE_LEN].into_boxed_slice(),
+        }
+    }
 }
 struct InternedString {
     text: String,
@@ -99,6 +113,9 @@ struct InternedString {
     comparison_number: Option<f64>,
 }
 impl Values {
+    pub fn numeric_cache_ptr(&self) -> *const f64 {
+        self.numeric_cache.as_ptr()
+    }
     pub fn encode(&mut self, value: ScratchValue) -> u64 {
         match value {
             ScratchValue::Number(n) => number(n),
@@ -117,6 +134,9 @@ impl Values {
                         },
                         text: s.clone(),
                     };
+                    if let Some(cached) = self.numeric_cache.get_mut(id) {
+                        *cached = entry.comparison_number.unwrap_or(0.);
+                    }
                     if id == self.strings.len() {
                         self.strings.push(Some(entry));
                     } else {
@@ -268,6 +288,14 @@ mod tests {
         let encoded: Vec<_> = samples.iter().cloned().map(|s| values.encode(s)).collect();
         for (i, a) in samples.iter().enumerate() {
             assert_eq!(values.to_number(encoded[i]), a.to_number(), "{a:?}");
+            if encoded[i] & 0xffff_0000_0000_0000 == STRING_TAG {
+                let id = (encoded[i] & 0xffff_ffff) as usize;
+                assert_eq!(
+                    values.numeric_cache[id],
+                    a.to_number(),
+                    "native cache: {a:?}"
+                );
+            }
             assert_eq!(values.to_bool(encoded[i]), a.to_bool(), "{a:?}");
             for (j, b) in samples.iter().enumerate() {
                 assert_eq!(
@@ -285,5 +313,6 @@ mod tests {
         assert_eq!(values.to_number(reused), 0.0);
         assert!(!values.to_bool(reused));
         assert_eq!(values.decode(reused), ScratchValue::String("FALSE".into()));
+        assert_eq!(values.numeric_cache[(reused & 0xffff_ffff) as usize], 0.);
     }
 }

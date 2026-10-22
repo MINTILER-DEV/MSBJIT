@@ -364,6 +364,7 @@ pub(crate) struct JitState {
     pub local_vars: *mut u64,
     pub local_lists: *mut ListView,
     pub loops: *mut f64,
+    pub numeric_strings: *const f64,
 }
 #[repr(C)]
 pub(crate) struct Vm {
@@ -433,6 +434,7 @@ impl Vm {
                 local_vars: vars.as_mut_ptr(),
                 local_lists: list_views.as_mut_ptr(),
                 loops: std::ptr::null_mut(),
+                numeric_strings: program.values.numeric_cache_ptr(),
             },
             input: InputState::default(),
             interactive: false,

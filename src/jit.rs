@@ -665,10 +665,12 @@ impl Emitter<'_> {
         let valid = self.b.create_block();
         let join = self.b.create_block();
         self.b.append_block_param(join, types::I64);
-        let boxed = self.boxed(index);
-        self.b.ins().brif(boxed, slow, &[], numeric, &[]);
+        self.b.ins().jump(numeric, &[]);
         self.b.switch_to_block(numeric);
-        let n = self.b.ins().bitcast(types::F64, ir::MemFlags::new(), index);
+        // Numeric strings and booleans are also valid Scratch indices. Special
+        // indices such as last/random coerce to zero here, fail the range check,
+        // and reach the original helper with their text unchanged.
+        let n = self.num(index);
         let n = self.b.ins().floor(n);
         let len = self.b.ins().load(
             self.pointer,
@@ -776,8 +778,9 @@ impl Emitter<'_> {
         {
             return self.b.ins().f64const(number);
         }
-        // Numbers take a native fast path; only boxed strings/booleans cross
-        // the host ABI for Scratch coercion.
+        // Preserve the number fast path. Boxed values use a stable, bounded
+        // string coercion table or a native boolean conversion; only handles
+        // beyond the cache cross the helper ABI.
         let tag = self.b.ins().band_imm(bits, 0xfffe_0000_0000_0000u64 as i64);
         let boxed = self.b.ins().icmp_imm(
             ir::condcodes::IntCC::Equal,
@@ -796,6 +799,44 @@ impl Emitter<'_> {
         let n = self.b.ins().select(nan, zero, n);
         self.b.ins().jump(join, &[n.into()]);
         self.b.switch_to_block(slow);
+        let boolean = self.b.create_block();
+        let string = self.b.create_block();
+        let cached = self.b.create_block();
+        let fallback = self.b.create_block();
+        let full_tag = self.b.ins().band_imm(bits, 0xffff_0000_0000_0000u64 as i64);
+        let is_bool = self.b.ins().icmp_imm(
+            ir::condcodes::IntCC::Equal,
+            full_tag,
+            crate::value::BOOL_TAG as i64,
+        );
+        self.b.ins().brif(is_bool, boolean, &[], string, &[]);
+        self.b.switch_to_block(boolean);
+        let n = self.b.ins().band_imm(bits, 1);
+        let n = self.b.ins().fcvt_from_uint(types::F64, n);
+        self.b.ins().jump(join, &[n.into()]);
+        self.b.switch_to_block(string);
+        let index = self.b.ins().band_imm(bits, 0xffff_ffff);
+        let in_cache = self.b.ins().icmp_imm(
+            ir::condcodes::IntCC::UnsignedLessThan,
+            index,
+            crate::value::NUMERIC_CACHE_LEN as i64,
+        );
+        self.b.ins().brif(in_cache, cached, &[], fallback, &[]);
+        self.b.switch_to_block(cached);
+        let table = self.load(self.pointer, offset_of!(JitState, numeric_strings));
+        let offset = if self.pointer == types::I32 {
+            self.b.ins().ireduce(self.pointer, index)
+        } else {
+            index
+        };
+        let offset = self.b.ins().ishl_imm(offset, 3);
+        let address = self.b.ins().iadd(table, offset);
+        let n = self
+            .b
+            .ins()
+            .load(types::F64, ir::MemFlags::trusted(), address, 0);
+        self.b.ins().jump(join, &[n.into()]);
+        self.b.switch_to_block(fallback);
         let n = self.call("number", &[bits]).unwrap();
         self.b.ins().jump(join, &[n.into()]);
         self.b.switch_to_block(join);
